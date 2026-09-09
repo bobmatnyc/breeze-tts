@@ -73,10 +73,21 @@ def publish_directory(target: Path, build: Callable[[Path], None]) -> Path:
     directory removed and ``target`` untouched, so the next attempt retries from
     scratch rather than inheriting a partial result.
 
+    Space: staging beside the target means both exist at once, which needs room
+    for two copies. An *incomplete* target is unusable by definition, so it is
+    deleted before staging starts rather than kept — the 7.2 GB checkpoint lives
+    on a 10 GB volume, where holding two copies would fill the disk and make
+    every retry fail the same way. A complete target is kept until the swap, so
+    replacing one still needs the room.
+
     Test: `test_publish_directory_is_atomic`,
-    `test_publish_directory_discards_failed_build`
+    `test_publish_directory_discards_failed_build`,
+    `test_publish_directory_reclaims_an_incomplete_target`
     """
     target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() and not is_complete(target):
+        shutil.rmtree(target, ignore_errors=True)
+    _clear_stale_staging(target)
     staging = Path(
         tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=str(target.parent))
     )
@@ -92,6 +103,21 @@ def publish_directory(target: Path, build: Callable[[Path], None]) -> Path:
         shutil.rmtree(staging, ignore_errors=True)
         raise
     return target
+
+
+def _clear_stale_staging(target: Path) -> None:
+    """Delete staging directories a previous killed attempt left behind.
+
+    They are only ever reachable by this helper — nothing renames them into
+    place after the process that made them dies — so on a small volume they are
+    pure leaked space that would starve the next download.
+
+    Test: `test_publish_directory_clears_stale_staging`
+    """
+    for leftover in target.parent.glob(f".{target.name}.staging-*"):
+        shutil.rmtree(leftover, ignore_errors=True)
+    for leftover in target.parent.glob(f".{target.name}.old-*"):
+        shutil.rmtree(leftover, ignore_errors=True)
 
 
 def write_file_atomically(path: Path, payload: bytes) -> None:

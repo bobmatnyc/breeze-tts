@@ -166,6 +166,13 @@ directory under an `flock` on the volume and is renamed into place only when it
 completes, so a concurrent worker waits rather than racing and an interrupted
 attempt is discarded and retried on the next start.
 
+Staging beside the target would mean two copies on the volume at once — 14.4 GB
+where only 10 GB exists. An incomplete checkpoint is unusable by definition, so
+it is deleted before staging starts, along with any staging directory a killed
+attempt leaked; peak usage stays at one copy. Sizing the volume for two copies
+instead would work, at double the monthly cost for space that is idle except
+during a re-download.
+
 ## Invoking it
 
 ```bash

@@ -74,6 +74,52 @@ def test_publish_directory_replaces_an_existing_target(tmp_path) -> None:
     assert is_complete(target)
 
 
+def test_publish_directory_reclaims_an_incomplete_target(tmp_path) -> None:
+    """An unusable target is deleted before staging, so peak disk stays at one copy."""
+    target = tmp_path / "breeze-tts-2"
+    (target / "audio_tokenizer").mkdir(parents=True)
+    (target / "big.bin").write_bytes(b"y" * 4096)
+
+    observed: list[bool] = []
+
+    def build(staging: Path) -> None:
+        observed.append(target.exists())
+        (staging / "big.bin").write_bytes(b"z" * 4096)
+
+    publish_directory(target, build)
+
+    assert observed == [False]
+    assert (target / "big.bin").read_bytes() == b"z" * 4096
+
+
+def test_publish_directory_keeps_a_complete_target_until_the_swap(tmp_path) -> None:
+    target = tmp_path / "payload"
+    publish_directory(target, lambda s: (s / "v.txt").write_text("first"))
+
+    observed: list[str] = []
+
+    def build(staging: Path) -> None:
+        observed.append((target / "v.txt").read_text())
+        (staging / "v.txt").write_text("second")
+
+    publish_directory(target, build)
+
+    assert observed == ["first"]
+    assert (target / "v.txt").read_text() == "second"
+
+
+def test_publish_directory_clears_stale_staging(tmp_path) -> None:
+    target = tmp_path / "payload"
+    orphan = tmp_path / ".payload.staging-dead"
+    orphan.mkdir()
+    (orphan / "leaked.bin").write_bytes(b"w" * 1024)
+
+    publish_directory(target, lambda s: (s / "v.txt").write_text("fresh"))
+
+    assert not orphan.exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["payload"]
+
+
 def test_write_file_atomically_replaces_content(tmp_path) -> None:
     path = tmp_path / "meta.json"
     write_file_atomically(path, b"one")
