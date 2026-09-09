@@ -50,6 +50,43 @@ def test_drop_section_removes_a_bold_pseudo_heading() -> None:
     assert "AI Power Ranking" not in speech
 
 
+TWO_PSEUDO_HEADINGS = """## The argument
+
+The body of the piece.
+
+**Related reading:**
+- [What Is Harness Engineering?](https://example.com/harness). Why it matters
+
+**About the author:**
+Bob writes about AI-augmented engineering practice.
+"""
+
+
+def test_drop_section_stops_at_the_next_pseudo_heading() -> None:
+    """Two bold pseudo-headings in a row: dropping the first must keep the second.
+
+    The regression: a pseudo-heading's section was terminated only by a real ATX
+    heading, so with no `#` between them the drop swallowed the bio as well —
+    silently, because a dropped section leaves no trace in the output.
+    """
+    speech = speech_text.markdown_to_speech(
+        TWO_PSEUDO_HEADINGS, drop_sections=["Related reading"]
+    )
+
+    assert "Harness Engineering" not in speech
+    assert "About the author:" in speech
+    assert "Bob writes about AI-augmented engineering practice." in speech
+
+
+def test_select_section_stops_at_the_next_pseudo_heading() -> None:
+    """Selecting the first of two adjacent pseudo-headings excludes the second."""
+    body = speech_text.select_section(TWO_PSEUDO_HEADINGS, "Related reading")
+
+    assert "Harness Engineering" in body
+    assert "About the author" not in body
+    assert "Bob writes about" not in body
+
+
 def test_drop_section_stops_at_the_next_heading() -> None:
     document = "# One\n\nKept.\n\n## Two\n\nDropped.\n\n## Three\n\nAlso kept.\n"
 

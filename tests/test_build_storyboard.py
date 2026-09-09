@@ -92,15 +92,19 @@ def test_load_records_honours_the_reading_subset(tmp_path):
     assert [record["index"] for record in kept] == [0, 1, 2]
 
 
-def _fake(index: int, seconds: float) -> dict:
-    return {"index": index, "duration": seconds}
+def _fake(index: int, seconds: float, *, ends_paragraph: bool = True) -> dict:
+    return {"index": index, "duration": seconds, "ends_paragraph": ends_paragraph}
+
+
+NO_GAPS = {"sentence_gap_ms": 0, "paragraph_gap_ms": 0}
+READER_GAPS = {"sentence_gap_ms": 350, "paragraph_gap_ms": 700}
 
 
 def test_pack_records_fills_to_the_target():
     """A scene grows until the next chunk would carry it past the target."""
     records = [_fake(0, 12.0), _fake(1, 12.0), _fake(2, 12.0), _fake(3, 5.0)]
 
-    groups = build_storyboard.pack_records(records, 30.0)
+    groups = build_storyboard.pack_records(records, 30.0, **NO_GAPS)
 
     assert [[r["index"] for r in g] for g in groups] == [[0, 1], [2, 3]]
     assert [sum(r["duration"] for r in g) for g in groups] == [24.0, 17.0]
@@ -108,21 +112,74 @@ def test_pack_records_fills_to_the_target():
 
 def test_pack_records_never_splits_a_chunk():
     """A chunk longer than the target becomes its own scene, not two."""
-    groups = build_storyboard.pack_records([_fake(0, 55.0), _fake(1, 4.0)], 30.0)
+    groups = build_storyboard.pack_records(
+        [_fake(0, 55.0), _fake(1, 4.0)], 30.0, **NO_GAPS
+    )
 
     assert [[r["index"] for r in g] for g in groups] == [[0], [1]]
 
 
+def test_pack_records_counts_the_gaps_it_will_render():
+    """Three 9.8 s chunks fit 30 s of speech but not with two 0.7 s gaps in it."""
+    records = [_fake(index, 9.8) for index in range(3)]
+
+    without = build_storyboard.pack_records(records, 30.0, **NO_GAPS)
+    with_gaps = build_storyboard.pack_records(records, 30.0, **READER_GAPS)
+
+    assert [[r["index"] for r in g] for g in without] == [[0, 1, 2]]
+    assert [[r["index"] for r in g] for g in with_gaps] == [[0, 1], [2]]
+
+
 def test_pack_records_rejects_a_non_positive_target():
     with pytest.raises(SystemExit, match="must be positive"):
-        build_storyboard.pack_records([_fake(0, 1.0)], 0.0)
+        build_storyboard.pack_records([_fake(0, 1.0)], 0.0, **NO_GAPS)
+
+
+def test_group_seconds_uses_the_paragraph_gap_only_at_paragraph_ends():
+    group = [_fake(0, 1.0, ends_paragraph=False), _fake(1, 1.0), _fake(2, 1.0)]
+
+    seconds = build_storyboard.group_seconds(group, **READER_GAPS)
+
+    assert seconds == pytest.approx(3.0 + 0.350 + 0.700, abs=0.001)
+
+
+def test_group_seconds_matches_what_group_audio_renders(tmp_path):
+    """The packer's arithmetic must equal the WAV the builder actually writes."""
+    work_dir, records = make_work_dir(tmp_path, 5, parts_for={2: 3})
+
+    for size in (2, 3, 5):
+        group = records[:size]
+        predicted = build_storyboard.group_seconds(group, **READER_GAPS)
+        _, rendered = build_storyboard.group_audio(
+            group, work_dir, tmp_path / "merged", **READER_GAPS
+        )
+
+        assert rendered == pytest.approx(predicted, abs=0.01), f"group of {size}"
+
+
+def test_packed_scenes_render_within_the_target(tmp_path):
+    """End to end: no packed multi-chunk scene renders past --scene-seconds."""
+    work_dir, records = make_work_dir(tmp_path, 12, parts_for={4: 2})
+    target = 4.0
+
+    groups = build_storyboard.pack_records(records, target, **READER_GAPS)
+
+    assert len(groups) > 1, "the fixture must actually need packing"
+    for group in groups:
+        _, rendered = build_storyboard.group_audio(
+            group, work_dir, tmp_path / "merged", **READER_GAPS
+        )
+        if len(group) > 1:
+            assert rendered <= target + 0.01, [r["index"] for r in group]
 
 
 def test_plan_scenes_falls_back_to_the_ceiling():
     """`--max-scenes` still binds when the duration target packs too loosely."""
     records = [_fake(index, 40.0) for index in range(10)]
 
-    scenes = build_storyboard.plan_scenes(records, target_seconds=40.0, max_groups=4)
+    scenes = build_storyboard.plan_scenes(
+        records, target_seconds=40.0, max_groups=4, **NO_GAPS
+    )
 
     assert len(scenes) == 4
     assert [r["index"] for scene in scenes for r in scene] == list(range(10))

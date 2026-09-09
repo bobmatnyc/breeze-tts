@@ -75,11 +75,15 @@ def _section_bounds(text: str, heading: str) -> tuple[int, int, int]:
     """Locate one section as `(heading_start, body_start, section_end)`.
 
     The section runs to the next heading at the same or a shallower level, or to
-    the end of the document. A pseudo-heading's level 7 is clamped to 6 when
-    looking for that next heading, so it ends at the next real heading.
+    the end of the document. A pseudo-heading sits at level 7, so every heading
+    is same-or-shallower and it ends at the next heading of any kind — including
+    the next pseudo-heading. Ending it only at a real ATX heading would let a
+    drop of `**Related reading:**` swallow a following `**About the author:**`
+    with nothing in the output to show it happened.
 
     Test: `test_select_section_returns_only_that_section`,
-    `test_drop_section_stops_at_the_next_heading`
+    `test_drop_section_stops_at_the_next_heading`,
+    `test_drop_section_stops_at_the_next_pseudo_heading`
     """
     title = _normalise_title(heading)
     spans = _heading_spans(text)
@@ -88,7 +92,7 @@ def _section_bounds(text: str, heading: str) -> tuple[int, int, int]:
             continue
         stop = len(text)
         for next_start, _, next_level, _ in spans[position + 1 :]:
-            if next_level <= min(level, 6):
+            if next_level <= level:
                 stop = next_start
                 break
         return start, end, stop

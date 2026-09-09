@@ -135,17 +135,22 @@ Two avatar scenes plus the body scenes must stay under HeyGen's 50-scene ceiling
 The builder packs adjacent chunks into one scene until adding the next chunk
 would carry the scene past `--scene-seconds` (default 40), concatenating their
 WAVs with the reader's own gaps — the wider paragraph gap between chunks that
-ended a paragraph. A chunk is never split, so a chunk longer than the target
-becomes its own scene. `--max-scenes` is a hard backstop that merges the packed
-scenes further if the count is still too high, and both steps report on stderr.
+ended a paragraph. Those gaps count towards the target, so `--scene-seconds`
+bounds the rendered scene rather than the speech inside it; on this body that is
+about 0.7 s per join, and ignoring it used to push the longest scene past the
+target. A chunk is never split, so a chunk longer than the target becomes its own
+scene and is the only way a packed scene exceeds it. `--max-scenes` is a hard
+backstop that merges the packed scenes further if the count is still too high —
+that step can exceed the target, because HeyGen refuses a 51-scene request
+outright while a long scene only looks wrong. Both steps report on stderr.
 
 Packing by duration rather than by chunk count is what makes a long body work. A
 15-minute article is about 70 chunks, and chunk length follows the source
 paragraphs, so splitting into equal counts gives scenes anywhere from 5 s to
-60 s. On the full-article run, packing 71 chunks to a 40 s target gave **30 body
-scenes plus the two avatar scenes — 32 in all**, from 19.0 s to 41.1 s, mean
-31.3 s, none over 45 s. Equal-count grouping of the same chunks into 30 scenes
-would have ranged 5.4 s to 57.4 s.
+60 s. Packing the full article's 71 chunks to a 40 s target gives **31 body
+scenes plus the two avatar scenes — 33 in all**, from 19.0 s to 39.8 s, mean
+30.3 s. Equal-count grouping of the same chunks into 30 scenes would have ranged
+5.4 s to 57.4 s.
 
 Render, poll, download. Uploads are cached by file sha256, so a re-run of
 `render` re-uses every asset id instead of uploading again.
@@ -186,6 +191,11 @@ Matsuoka only in the frontmatter, the author footer and a link URL, and the
 reader already drops all three — so adding the lexicon changed no chunk text and
 dropping "Related reading" only shortened the list. All 71 chunks came back
 cached: 0 endpoint calls, 0.1 s of wall time, no spend.
+
+That render went out at 32 scenes, before the packer counted the silence it
+inserts: three of its 30 body scenes ran past the 40 s target, the longest at
+41.1 s. Rebuilt with the gap-aware packer the same body gives 31 scenes, none
+over 39.8 s. The figures below are the render that shipped.
 
 ### Credit gate before rendering
 

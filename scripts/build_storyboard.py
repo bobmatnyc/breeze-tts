@@ -12,8 +12,9 @@ scene, cycles the supplied images across those scenes (hero first), and brackets
 them with an avatar scene for the intro audio and another for the closing.
 A chunk the reader had to re-split arrives as several part WAVs, so its parts are
 concatenated with the reader's own sentence gap. Adjacent chunks are packed into
-one scene until it reaches `--scene-seconds`, joined the same way — with the wider
-paragraph gap between chunks that ended a paragraph — and `--max-scenes` merges
+one scene up to `--scene-seconds`, joined the same way — with the wider paragraph
+gap between chunks that ended a paragraph — and the packer counts that silence,
+so a scene's rendered length is what the target bounds. `--max-scenes` merges
 further if the packed count still exceeds HeyGen's ceiling. Both are reported on
 stderr.
 
@@ -79,8 +80,46 @@ def load_records(work_dir: Path) -> list[dict]:
     return [record for record in chunks if record["index"] in wanted]
 
 
-def pack_records(records: list[dict], target_seconds: float) -> list[list[dict]]:
-    """Pack adjacent chunks into scenes of roughly `target_seconds` each.
+def group_seconds(
+    group: list[dict], *, sentence_gap_ms: int, paragraph_gap_ms: int
+) -> float:
+    """Seconds a group of chunks will render to, silence included.
+
+    Why: `group_audio` joins a group's part WAVs with the reader's gaps, so a
+    group's rendered length is longer than the sum of its chunk durations by one
+    gap per interior join. Packing against the durations alone let scenes run
+    past `--scene-seconds` — the full-article run's longest came out 41.1 s
+    against a 40 s target.
+
+    The gap rule is `plan_gaps`': every part takes the sentence gap unless it is
+    the last part of a chunk that ended a paragraph. `concatenate` drops the
+    final gap, so a group of n parts carries n-1 of them.
+
+    Test: `test_group_seconds_matches_what_group_audio_renders`
+    """
+    seconds = 0.0
+    gaps_ms: list[int] = []
+    for record in group:
+        parts = record.get("parts") or [record]
+        for position, part in enumerate(parts):
+            seconds += float(part.get("duration") or 0.0)
+            last = position == len(parts) - 1
+            gaps_ms.append(
+                paragraph_gap_ms
+                if last and record.get("ends_paragraph")
+                else sentence_gap_ms
+            )
+    return seconds + sum(gaps_ms[:-1]) / 1000.0
+
+
+def pack_records(
+    records: list[dict],
+    target_seconds: float,
+    *,
+    sentence_gap_ms: int,
+    paragraph_gap_ms: int,
+) -> list[list[dict]]:
+    """Pack adjacent chunks into scenes of at most `target_seconds` each.
 
     Why: one scene per chunk gives a 15-minute reading 70 scenes, past HeyGen's
     50-scene ceiling, and splitting by chunk count instead produces scenes from
@@ -88,24 +127,25 @@ def pack_records(records: list[dict], target_seconds: float) -> list[list[dict]]
     duration is what puts every scene in the same range.
 
     The rule: walk the chunks in order and start a new scene whenever adding the
-    next chunk would carry the current one past the target. A chunk is never
-    split, so a single chunk longer than the target becomes its own scene.
+    next chunk would carry the current one — silence included, via
+    `group_seconds` — past the target. A chunk is never split, so a single chunk
+    longer than the target becomes its own scene and is the only way a scene
+    exceeds it.
 
     Test: `test_pack_records_fills_to_the_target`,
-    `test_pack_records_never_splits_a_chunk`
+    `test_pack_records_never_splits_a_chunk`,
+    `test_pack_records_counts_the_gaps_it_will_render`
     """
     if target_seconds <= 0:
         raise SystemExit("--scene-seconds must be positive.")
+    gaps = {"sentence_gap_ms": sentence_gap_ms, "paragraph_gap_ms": paragraph_gap_ms}
     groups: list[list[dict]] = []
     current: list[dict] = []
-    running = 0.0
     for record in records:
-        seconds = float(record.get("duration") or 0.0)
-        if current and running + seconds > target_seconds:
+        if current and group_seconds([*current, record], **gaps) > target_seconds:
             groups.append(current)
-            current, running = [], 0.0
+            current = []
         current.append(record)
-        running += seconds
     if current:
         groups.append(current)
     return groups
@@ -138,13 +178,27 @@ def group_records(records: list, max_groups: int) -> list[list]:
 
 
 def plan_scenes(
-    records: list[dict], *, target_seconds: float, max_groups: int
+    records: list[dict],
+    *,
+    target_seconds: float,
+    max_groups: int,
+    sentence_gap_ms: int = runpod_read.DEFAULT_SENTENCE_GAP_MS,
+    paragraph_gap_ms: int = runpod_read.DEFAULT_PARAGRAPH_GAP_MS,
 ) -> list[list[dict]]:
     """Pack chunks to the duration target, then merge further if still too many.
 
+    The `--max-scenes` fallback overrides the target, so a scene it produces can
+    run past `--scene-seconds`. That is the ceiling doing its job: HeyGen refuses
+    a 51-scene request outright, and a long scene only looks wrong.
+
     Test: `test_plan_scenes_falls_back_to_the_ceiling`
     """
-    packed = pack_records(records, target_seconds)
+    packed = pack_records(
+        records,
+        target_seconds,
+        sentence_gap_ms=sentence_gap_ms,
+        paragraph_gap_ms=paragraph_gap_ms,
+    )
     if len(packed) <= max_groups:
         return packed
     return [
@@ -287,7 +341,11 @@ def run(options: argparse.Namespace) -> int:
     records = load_records(options.body_dir)
     budget = options.max_scenes - 2
     groups = plan_scenes(
-        records, target_seconds=options.scene_seconds, max_groups=budget
+        records,
+        target_seconds=options.scene_seconds,
+        max_groups=budget,
+        sentence_gap_ms=options.sentence_gap_ms,
+        paragraph_gap_ms=options.paragraph_gap_ms,
     )
     if len(groups) < len(records):
         print(
@@ -360,7 +418,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--scene-seconds",
         type=float,
         default=DEFAULT_SCENE_SECONDS,
-        help="Pack adjacent chunks up to this many seconds per image scene.",
+        help="Pack adjacent chunks up to this many rendered seconds per image "
+        "scene, counting the silence between them.",
     )
     parser.add_argument(
         "--sentence-gap-ms", type=int, default=runpod_read.DEFAULT_SENTENCE_GAP_MS
