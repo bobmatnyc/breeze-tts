@@ -189,7 +189,7 @@ def test_group_audio_joins_a_resplit_chunks_parts(tmp_path):
 # --- Storyboard assembly ---------------------------------------------------
 
 
-def build(tmp_path, groups, audio, images, captions=False):
+def build(tmp_path, groups, audio, images, captions=False, engine="avatar_iii"):
     return build_storyboard.build_storyboard(
         intro_audio=tmp_path / "audio" / "intro.wav",
         closing_audio=tmp_path / "audio" / "closing.wav",
@@ -197,7 +197,7 @@ def build(tmp_path, groups, audio, images, captions=False):
         audio=audio,
         images=images,
         look_id="look_1",
-        engine="avatar_iii",
+        engine=engine,
         title="Test",
         aspect_ratio="16:9",
         resolution="1080p",
@@ -225,6 +225,17 @@ def test_build_storyboard_brackets_the_body(tmp_path):
     assert storyboard["aspect_ratio"] == "16:9"
     assert storyboard["resolution"] == "1080p"
     assert storyboard["title"] == "Test"
+
+
+def test_build_storyboard_omits_an_unset_engine(tmp_path):
+    work_dir, records = make_work_dir(tmp_path, 1)
+    audio = [(work_dir / "chunk_0000_p00.wav", 1.0)]
+    storyboard = build(
+        tmp_path, [[records[0]]], audio, [tmp_path / "hero.png"], engine=None
+    )
+    avatars = [scene for scene in storyboard["scenes"] if scene["type"] == "avatar"]
+    assert len(avatars) == 2
+    assert all("engine" not in scene for scene in avatars)
 
 
 def test_build_storyboard_cycles_images_across_body_scenes(tmp_path):

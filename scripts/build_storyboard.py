@@ -48,7 +48,6 @@ def _load_reader():
 runpod_read = _load_reader()
 
 DEFAULT_MAX_SCENES = 50
-DEFAULT_ENGINE = "avatar_iii"
 
 
 def load_records(work_dir: Path) -> list[dict]:
@@ -165,7 +164,7 @@ def build_storyboard(
     audio: list[tuple[Path, float]],
     images: list[Path],
     look_id: str,
-    engine: str,
+    engine: str | None,
     title: str,
     aspect_ratio: str,
     resolution: str,
@@ -174,19 +173,27 @@ def build_storyboard(
 ) -> dict:
     """Assemble the storyboard: intro avatar scene, image scenes, closing avatar.
 
+    An `engine` of None leaves the key out, so HeyGen applies its own default —
+    Avatar IV — which is what a photo-avatar look wants unless told otherwise.
+
     Test: `test_build_storyboard_brackets_the_body`,
-    `test_build_storyboard_cycles_images_across_body_scenes`
+    `test_build_storyboard_cycles_images_across_body_scenes`,
+    `test_build_storyboard_omits_an_unset_engine`
     """
-    picks = cycle_images(images, len(groups))
-    scenes: list[dict] = [
-        {
+
+    def avatar_scene(audio: Path, role: str) -> dict:
+        scene = {
             "type": "avatar",
             "avatar_id": look_id,
-            "engine": engine,
-            "audio": relative_to(intro_audio, base),
-            "role": "intro",
+            "audio": relative_to(audio, base),
+            "role": role,
         }
-    ]
+        if engine:
+            scene["engine"] = engine
+        return scene
+
+    picks = cycle_images(images, len(groups))
+    scenes: list[dict] = [avatar_scene(intro_audio, "intro")]
     for group, (path, seconds), image in zip(groups, audio, picks, strict=True):
         scene = {
             "type": "image",
@@ -199,15 +206,7 @@ def build_storyboard(
         if captions:
             scene["caption"] = " ".join(record["text"] for record in group)
         scenes.append(scene)
-    scenes.append(
-        {
-            "type": "avatar",
-            "avatar_id": look_id,
-            "engine": engine,
-            "audio": relative_to(closing_audio, base),
-            "role": "closing",
-        }
-    )
+    scenes.append(avatar_scene(closing_audio, "closing"))
     return {
         "title": title,
         "aspect_ratio": aspect_ratio,
@@ -276,7 +275,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Repeat in display order; the first is the hero.",
     )
     parser.add_argument("--look-id", required=True, help="HeyGen avatar look id.")
-    parser.add_argument("--engine", default=DEFAULT_ENGINE)
+    parser.add_argument(
+        "--engine",
+        help="Force an avatar engine (avatar_iii, avatar_iv, avatar_v). "
+        "Omit to let HeyGen apply its default, Avatar IV.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--merged-dir", type=Path)
     parser.add_argument("--title", default="Breeze TTS video")

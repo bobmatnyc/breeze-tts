@@ -21,10 +21,13 @@ used here.
 | `GET /v3/videos/{id}` | `data.status` is `pending`, `processing`, `completed` or `failed`, with `video_url` and `thumbnail_url` on success and `failure_message` on failure. |
 | `GET /v3/users/me` | Credit balance. The MCP server's `get_current_user` reads the same thing. |
 
-An avatar scene carries `input.avatar_id`, `input.audio_asset_id` and
-`input.engine` as an object — `{"type": "avatar_iii"}`, not a bare string. An
-image scene carries `source` (`{"type": "asset_id", "asset_id": …}`) and its own
-`audio_asset_id` at the scene's top level. There is no per-scene caption or
+An avatar scene carries `input.avatar_id`, `input.audio_asset_id` and, when you
+want to override the engine, `input.engine` as an object — `{"type":
+"avatar_iii"}`, not a bare string. Leaving `engine` out gets HeyGen's documented
+default, Avatar IV, which is what `build_storyboard.py` does unless `--engine`
+says otherwise. An image scene carries `source` (`{"type": "asset_id",
+"asset_id": …}`) and its own `audio_asset_id` at the scene's top level. There is
+no per-scene caption or
 text-overlay field in the studio schema, so `build_storyboard.py --captions`
 records each scene's spoken text in the storyboard for provenance only; pass
 `heygen_video.py render --burn-captions` to ask HeyGen for its own
@@ -53,10 +56,16 @@ python scripts/build_storyboard.py \
   --closing-audio outputs/hyperdev_test/audio/closing.wav \
   --image .../images/hero.png --image .../images/body-1-soloist.png \
   --image .../images/body-2-score.png --image .../images/body-3-rehearsal-hall.png \
-  --look-id 1a8b4f7828bd4b7fb778e06e92d87460 --engine avatar_iii --captions \
+  --look-id b112b52a65e74f89aee15343df6ac0a7 --captions \
   --title "Delegation as an Engineering Skill — HyperDev test" \
   --output outputs/hyperdev_test/storyboard.json
 ```
+
+Pick the look with `GET /v3/avatars/groups/{group_id}/looks` and read
+`image_width`, `image_height`, `preferred_orientation` and
+`supported_api_engines` off each entry. A 1920×1080 landscape look needs no
+crop at 16:9 1080p; a square or portrait look would be centre-cropped to the
+canvas.
 
 Two avatar scenes plus one per body chunk must stay under HeyGen's 50-scene
 ceiling. When the body has more chunks than fit, the builder merges adjacent
@@ -86,9 +95,20 @@ when the environment does not carry it.
 
 ## What the test run measured
 
-Voice `bob`, seed 42, endpoint `53bev6svysh8g4`, avatar look
-`1a8b4f7828bd4b7fb778e06e92d87460` (the "Robert Matsuoka" digital twin,
-1280×720, consent accepted), engine `avatar_iii`, output 16:9 1080p.
+Voice `bob`, seed 42, endpoint `53bev6svysh8g4`, output 16:9 1080p. The
+on-camera scenes use look `b112b52a65e74f89aee15343df6ac0a7`, "Focused software
+developer at desk", from the "Masa" group `cd2d487982134b85887f2b13459d9886`:
+a `photo_avatar`, 1920×1080 landscape, `status: completed`, so it fills a 16:9
+1080p frame with no crop. All 16 looks in that group support `avatar_iii`,
+`avatar_iv` and `avatar_v`; the storyboard names none, so HeyGen's default —
+Avatar IV — applies, and `expressiveness` defaults to `low`. A photo avatar
+needs no consent step, and none was required: every render went through on the
+first submission.
+
+An earlier pass rendered the same storyboard against the "Robert Matsuoka"
+digital twin `1a8b4f7828bd4b7fb778e06e92d87460` on `avatar_iii`. Both runs are
+recorded below, because the pair is the only per-engine cost comparison this
+account has.
 
 | Part | Source | Chunks | Audio |
 |---|---|---|---|
@@ -107,21 +127,47 @@ $0.1077 against the reader's own $0.1189 estimate.
 ### Credits
 
 The account is a Creator-plan subscription: **21 premium credits** and 1,505
-add-on credits before either render.
+add-on credits before any render.
 
-| Render | Video | Premium credits after | `remaining_quota.api` |
-|---|---|---|---|
-| Closing only, 13.12 s | `3c2ea3227dde51c5d7087fde64f1f625` | 21 | 4532 |
-| Full, 11 scenes | `474e593f17199cb569c3dd651c21c6c0` | 21 | 4288 |
+| Render | Avatar, engine | Video | Video id | Premium credits after | `api` quota after |
+|---|---|---|---|---|---|
+| Closing only | digital twin, `avatar_iii` | 13.12 s | `3c2ea3227dde51c5d7087fde64f1f625` | 21 | 4532 |
+| Full, 11 scenes | digital twin, `avatar_iii` | 295.04 s | `474e593f17199cb569c3dd651c21c6c0` | 21 | 4288 |
+| Closing only | photo avatar, default | 13.12 s | `3e819a2b219a89eb8623d67dab522b91` | 21 | 4257 |
+| Full, 11 scenes | photo avatar, default | 295.04 s | `829b77d07de87d4936788e5a2ddc9568` | 21 | 3824 |
 
-The premium-credit counter never moved. A 13-second render is well under one
-credit and the counter is an integer, so the test render's cost is only bounded,
-not measured: under half a credit. Scaling that bound to the full ~4.9-minute
-video gives at most 11.3 credits, and HeyGen's documented Creator-plan rate of
-one credit per minute gives about 5 — both leave more than the five credits the
-budget required, which is why the full render went ahead.
+**The premium-credit counter never moved.** Four renders, 616 seconds of video,
+and `premium_credits.remaining` stayed at 21 with `add_on_credits.remaining` at
+1,505. API renders on this account draw on an API quota instead, which is the
+column that does move.
 
-The legacy `GET /v2/user/remaining_quota` counter is finer-grained and did move:
-4532 to 4288, 244 units, during the full render. That endpoint is deprecated
-(sunset 2026-10-31) and its unit is undocumented, so treat it as a cross-check
-and not as the number of record.
+That quota is what makes a per-second cost measurable. The photo-avatar probe
+cost 31 units for 13.12 s of avatar, 2.36 units per second. Projecting the whole
+295-second video at that rate gives about 700 units against 4,257 remaining, and
+zero premium credits against the five the budget required, so the full render
+went ahead. It actually cost 433 units. The gap is the image scenes: 128.08 s of
+avatar at 2.36 units/s is 302 units, leaving 131 units for 166.96 s of image
+scenes, about 0.78 units per second. A still image over a voiceover is roughly a
+third the price of an animated face.
+
+The digital-twin pass on `avatar_iii` cost 244 units for the same 295 seconds,
+against 433 for the photo avatar on the default engine — the photo-avatar route
+is about 1.8× the price here.
+
+Read those unit figures as this account's own measurements, not as documented
+pricing. The counter comes from `GET /v2/user/remaining_quota`, which is
+deprecated (sunset 2026-10-31) and does not document its unit; `GET /v3/users/me`
+is the supported endpoint and reports only the integer credit pools, which are
+too coarse to show any of this.
+
+### Render times
+
+| Render | Video length | Server time |
+|---|---|---|
+| Closing, digital twin | 13.12 s | 40 s |
+| Full, digital twin | 295.04 s | 300 s |
+| Closing, photo avatar | 13.12 s | 43 s |
+| Full, photo avatar | 295.04 s | 200 s |
+
+Roughly real time or better. A 15-minute polling budget is generous for a video
+of this length; `status --timeout` defaults to 1800 s.
