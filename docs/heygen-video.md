@@ -1,6 +1,7 @@
 # Assembling a HeyGen video from a Breeze TTS reading
 
-`scripts/runpod_read.py` turns a document into narration WAVs.
+`scripts/runpod_read.py` turns a document into narration WAVs, with
+`scripts/speech_text.py` deciding which words it says.
 `scripts/build_storyboard.py` arranges those WAVs into scenes, and
 `scripts/heygen_video.py` uploads them and drives HeyGen's v3 API to a finished
 MP4. The three run in sequence: reader, storyboard, render, status, download.
@@ -33,6 +34,52 @@ records each scene's spoken text in the storyboard for provenance only; pass
 `heygen_video.py render --burn-captions` to ask HeyGen for its own
 transcript-derived captions instead.
 
+## Choosing the words: the lexicon and section dropping
+
+Two reader flags decide what the voice says before any audio exists. Both act on
+the Markdown, before chunking, so a change to either shows up as a changed chunk
+sha and resume re-synthesises exactly the chunks whose text moved.
+
+`--pronunciations <file>` names a JSON map of written form to spoken respelling;
+`scripts/pronunciations.json` is the default and ships one entry:
+
+```json
+{ "Matsuoka": "Mah-tsu-oh-ka" }
+```
+
+Matching is whole-word and case-insensitive, and the replacement carries the
+matched text's case, so `matsuoka` in a spoken URL comes out `mah-tsu-oh-ka`
+while `Matsuoka` in a sentence comes out `Mah-tsu-oh-ka`. `Matsuokas` does not
+match. Keys are tried longest first, so a two-word entry beats a one-word entry
+that is only its first word. `--no-pronunciations` reads every word as written.
+
+A respelling is a guess about how the model reads it, so pick one by ear rather
+than by rule. Three candidates were synthesised on voice `bob`, seed 42, and
+transcribed with local `faster-whisper` (medium.en, `compute_type="float32"`) as
+a weak check — Whisper hearing the real surname back means the respelling did not
+drift into a different word:
+
+| Respelling in the text | What Whisper heard |
+|---|---|
+| `Mah-tsu-oh-ka` | "Matsuoka" |
+| `Mahtsuoka` | "Machocca" |
+| `Mat-soo-oh-ka` | "Matsuoka" |
+
+The run-together form is the one to avoid; the syllable breaks are what keep the
+word intact. `Mah-tsu-oh-ka` ships as the default.
+
+The manifest records the lexicon's sha as `lexicon`, so a work directory says
+which respellings produced its audio and a re-run reports the change on stderr.
+
+`--drop-section "Related reading"` removes a section and everything under it,
+repeatable for more than one. It matches an ATX heading (`## Related reading`)
+and also a line that is nothing but bold text (`**Related reading:**`), which is
+where an article's trailing link list usually lives — read aloud that list is a
+run of titles and taglines with no sentences in it. The reader writes the indices
+it actually read into the manifest as `reading`, and `build_storyboard.py` builds
+scenes from that subset, so a dropped section's already-paid-for WAVs stay
+cached in `chunks` without re-entering the video.
+
 ## The sequence
 
 Read the body. A word budget of 80 gives one chunk per source paragraph, which
@@ -44,6 +91,16 @@ python scripts/runpod_read.py --endpoint-id 53bev6svysh8g4 --voice bob \
   --output outputs/hyperdev_test/audio/body.wav \
   --work-dir outputs/hyperdev_test/audio/body \
   --word-budget 80 --seed 42 --env-file .env.local
+```
+
+For a whole article, keep the default word budget and drop the link list:
+
+```bash
+python scripts/runpod_read.py --endpoint-id 53bev6svysh8g4 --voice bob \
+  --input .../final.md --drop-section "Related reading" \
+  --output outputs/hyperdev_test/audio/body_full.wav \
+  --work-dir outputs/reads/hyperdev_delegation_article_bob \
+  --seed 42 --env-file .env.local
 ```
 
 Resume validates the audio it finds, not just its filename: a re-run re-reads
@@ -72,10 +129,23 @@ Pick the look with `GET /v3/avatars/groups/{group_id}/looks` and read
 crop at 16:9 1080p; a square or portrait look would be centre-cropped to the
 canvas.
 
-Two avatar scenes plus one per body chunk must stay under HeyGen's 50-scene
-ceiling. When the body has more chunks than fit, the builder merges adjacent
-chunks — concatenating their WAVs with the reader's own paragraph gap — and says
-so on stderr. Nine chunks needed no merging here.
+### The scene budget
+
+Two avatar scenes plus the body scenes must stay under HeyGen's 50-scene ceiling.
+The builder packs adjacent chunks into one scene until adding the next chunk
+would carry the scene past `--scene-seconds` (default 40), concatenating their
+WAVs with the reader's own gaps — the wider paragraph gap between chunks that
+ended a paragraph. A chunk is never split, so a chunk longer than the target
+becomes its own scene. `--max-scenes` is a hard backstop that merges the packed
+scenes further if the count is still too high, and both steps report on stderr.
+
+Packing by duration rather than by chunk count is what makes a long body work. A
+15-minute article is about 70 chunks, and chunk length follows the source
+paragraphs, so splitting into equal counts gives scenes anywhere from 5 s to
+60 s. On the full-article run, packing 71 chunks to a 40 s target gave **30 body
+scenes plus the two avatar scenes — 32 in all**, from 19.0 s to 41.1 s, mean
+31.3 s, none over 45 s. Equal-count grouping of the same chunks into 30 scenes
+would have ranged 5.4 s to 57.4 s.
 
 Render, poll, download. Uploads are cached by file sha256, so a re-run of
 `render` re-uses every asset id instead of uploading again.
@@ -98,7 +168,56 @@ run free.
 The key comes from `HEYGEN_API_KEY` in the environment, or from `--env-file`
 when the environment does not carry it.
 
-## What the test run measured
+## What the full-article run measured
+
+The second run replaced the abridged body with the whole article and both avatar
+scripts with lexicon-aware re-reads. Voice `bob`, seed 42, endpoint
+`53bev6svysh8g4`, look `b112b52a65e74f89aee15343df6ac0a7`, 16:9 1080p.
+
+| Part | Source | Chunks | Audio |
+|---|---|---|---|
+| Intro | `intro.md`, 351 words | 9 | 117.09 s |
+| Body | `final.md` less "Related reading" | 71 | 959.90 s assembled, 911.60 s of speech |
+| Closing | `closing_v2.md`, 65 words | 1 | 22.08 s |
+
+The body reused the existing `outputs/reads/hyperdev_delegation_article_bob`
+work directory. Its `speech.txt` holds no lexicon key — the article names
+Matsuoka only in the frontmatter, the author footer and a link URL, and the
+reader already drops all three — so adding the lexicon changed no chunk text and
+dropping "Related reading" only shortened the list. All 71 chunks came back
+cached: 0 endpoint calls, 0.1 s of wall time, no spend.
+
+### Credit gate before rendering
+
+`GET /v2/user/remaining_quota` reported `api: 3824`. At the first run's measured
+rates — 2.4 units per avatar-second, 0.8 per image-second — 139.17 s of avatar
+and 939.95 s of images project to 1,086 units, leaving about 2,738 against a
+500-unit floor. The gate passed and the render went ahead.
+
+### What it cost
+
+| Measure | Before | After | Delta |
+|---|---|---|---|
+| HeyGen `api` quota | 3,824 | 2,562 | 1,262 units |
+| RunPod balance | $20.2051 | $20.0235 | $0.1816 |
+
+The render finished in 334 s for 1,079.13 s of video, about 3.2× real time, and
+`ffprobe` reports 1920×1080 h264 at 25 fps.
+
+The projection was 16% low: 1,086 units predicted against 1,262 spent. Holding
+the avatar rate at 2.4 units/s, the image scenes came out at about 0.99 units per
+second rather than the first run's 0.78. Project image scenes at 1.0 units/s
+until a third run says otherwise; the floor check is what makes an under-estimate
+survivable, not the estimate itself.
+
+RunPod spend covers three one-sentence pronunciation probes, the intro re-read
+and the closing read; the body cost nothing because every chunk was cached. The
+reader's own estimate for that work was $0.121 against the $0.182 the balance
+moved. The gap is worker delay time — the first probe waited 355 s for a cold
+start — which RunPod bills and `executionTime` does not report, plus an
+unrelated pod on the account spending $0.023/hr throughout.
+
+## What the first test run measured
 
 Voice `bob`, seed 42, endpoint `53bev6svysh8g4`, output 16:9 1080p. The
 on-camera scenes use look `b112b52a65e74f89aee15343df6ac0a7`, "Focused software
@@ -140,6 +259,7 @@ add-on credits before any render.
 | Full, 11 scenes | digital twin, `avatar_iii` | 295.04 s | `474e593f17199cb569c3dd651c21c6c0` | 21 | 4288 |
 | Closing only | photo avatar, default | 13.12 s | `3e819a2b219a89eb8623d67dab522b91` | 21 | 4257 |
 | Full, 11 scenes | photo avatar, default | 295.04 s | `829b77d07de87d4936788e5a2ddc9568` | 21 | 3824 |
+| Full article, 32 scenes | photo avatar, default | 1079.13 s | `6f501fa9e84e7d30f19286bf03023215` | 21 | 2562 |
 
 **The premium-credit counter never moved.** Four renders, 616 seconds of video,
 and `premium_credits.remaining` stayed at 21 with `add_on_credits.remaining` at
@@ -173,6 +293,8 @@ too coarse to show any of this.
 | Full, digital twin | 295.04 s | 300 s |
 | Closing, photo avatar | 13.12 s | 43 s |
 | Full, photo avatar | 295.04 s | 200 s |
+| Full article, photo avatar | 1079.13 s | 334 s |
 
-Roughly real time or better. A 15-minute polling budget is generous for a video
-of this length; `status --timeout` defaults to 1800 s.
+Faster than real time in every case, and the margin widens with length: the
+18-minute video rendered in 3.2× real time against the 295-second video's 1.5×.
+`status --timeout` defaults to 1800 s, which is enough for both.

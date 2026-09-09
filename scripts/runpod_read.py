@@ -6,19 +6,20 @@ worker stops at `MAX_NEW_TOKENS` (1500 decode steps, about 12.6 per second of
 audio) and returns `truncated: true`. Anything longer than roughly 115 s of
 speech has to be split, synthesised piecewise and stitched back together.
 
-What: strips Markdown down to speakable prose, splits it at sentence boundaries
-under a word budget, clones each chunk with a fixed seed, and concatenates the
-chunk WAVs with a silence gap that widens at paragraph breaks. Per-chunk WAVs
-and a manifest live in a work directory, so a re-run resynthesises only what is
-missing.
+What: `scripts/speech_text.py` reduces the document to the words to be spoken;
+this script splits those at sentence boundaries under a word budget, clones each
+chunk with a fixed seed, and concatenates the chunk WAVs with a silence gap that
+widens at paragraph breaks. Per-chunk WAVs and a manifest live in a work
+directory, so a re-run resynthesises only what is missing.
 
 Usage:
     python scripts/runpod_read.py --endpoint-id <id> --voice bob \\
         --input article.md --output outputs/article.wav \\
         --work-dir outputs/reads/article --mp3
 
-Test: `test_markdown_to_speech_drops_frontmatter_and_footer`,
-`test_chunk_text_respects_word_budget`, `test_synthesise_resumes_from_manifest`
+Test: `test_chunk_text_respects_word_budget`,
+`test_synthesise_resumes_from_manifest`,
+`test_synthesise_redoes_only_the_chunks_a_lexicon_change_touched`
 """
 
 from __future__ import annotations
@@ -39,6 +40,30 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import runpod_clone  # noqa: E402  (path is set up immediately above)
+import speech_text  # noqa: E402  (same)
+from speech_text import (  # noqa: E402  (same)
+    AUTHOR_FOOTER_PREFIX,
+    DEFAULT_PRONUNCIATIONS,
+    apply_pronunciations,
+    drop_section,
+    lexicon_sha,
+    load_pronunciations,
+    markdown_to_speech,
+    select_section,
+    strip_frontmatter,
+)
+
+__all__ = [
+    "AUTHOR_FOOTER_PREFIX",
+    "apply_pronunciations",
+    "drop_section",
+    "lexicon_sha",
+    "load_pronunciations",
+    "markdown_to_speech",
+    "select_section",
+    "speech_text",
+    "strip_frontmatter",
+]
 
 SAMPLE_RATE = 24_000
 SAMPLE_WIDTH = 2
@@ -57,159 +82,10 @@ MAX_RESPLIT_DEPTH = 3
 # reading on record, so this only absorbs float rounding in the manifest.
 PART_DURATION_TOLERANCE_S = 0.05
 
-AUTHOR_FOOTER_PREFIX = "Bob Matsuoka is CTO"
-
 _ABBREVIATIONS = frozenset(
     """mr. mrs. ms. dr. prof. sr. jr. st. inc. ltd. co. corp. vs. etc. e.g. i.e.
     cf. approx. fig. no. dept. est. al. a.m. p.m. u.s. u.k.""".split()
 )
-
-
-# --- Markdown to speakable text -------------------------------------------
-
-
-def strip_frontmatter(text: str) -> str:
-    """Drop a leading YAML frontmatter block delimited by `---` lines.
-
-    Test: `test_markdown_to_speech_drops_frontmatter_and_footer`
-    """
-    if not text.startswith("---"):
-        return text
-    match = re.match(r"^---\r?\n.*?\r?\n---[ \t]*\r?\n?", text, flags=re.DOTALL)
-    return text[match.end() :] if match else text
-
-
-def select_section(text: str, heading: str) -> str:
-    """Return one Markdown section's body, named by its heading.
-
-    The heading may be given with or without its `#` markers. The section runs
-    to the next heading at the same or a shallower level.
-
-    Test: `test_select_section_returns_only_that_section`,
-    `test_select_section_rejects_unknown_heading`
-    """
-    wanted = heading.strip()
-    hashes, _, title = wanted.partition(" ")
-    title = title.strip() if set(hashes) == {"#"} else wanted
-    for match in re.finditer(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", text, flags=re.MULTILINE):
-        if match.group(2).strip().casefold() != title.casefold():
-            continue
-        level = len(match.group(1))
-        body = text[match.end() :]
-        following = re.search(rf"^#{{1,{level}}}[ \t]+", body, flags=re.MULTILINE)
-        return body[: following.start()] if following else body
-    raise SystemExit(f"No section titled {title!r} in the input.")
-
-
-def _strip_blocks(text: str) -> str:
-    """Remove fenced code, HTML, footnote definitions and link definitions.
-
-    An HTML element that starts its own line is a block — a figure, an embed,
-    a caption — so it goes entirely, contents included. A tag sitting inside a
-    sentence loses only the tag, because the words around it are still prose.
-
-    A reference link definition — `[label]: https://… "Title"` on its own line —
-    is machinery for the `[text][label]` form, never speech, so the whole line
-    goes. `_strip_inline` cannot do it: with no parentheses and no second
-    bracket, the line matches none of its link rules and the URL is read aloud.
-
-    Test: `test_markdown_to_speech_drops_reference_link_definitions`
-    """
-    text = re.sub(
-        r"^[ \t]*(```|~~~).*?^[ \t]*\1[ \t]*$",
-        "",
-        text,
-        flags=re.DOTALL | re.MULTILINE,
-    )
-    text = re.sub(r"^\[\^[^\]]+\]:.*(?:\n[ \t]+\S.*)*\n?", "", text, flags=re.MULTILINE)
-    text = re.sub(
-        r"^[ \t]{0,3}\[[^\^\]][^\]]*\]:[ \t]*<?\S+>?"
-        r"(?:[ \t]+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?[ \t]*$\n?",
-        "",
-        text,
-        flags=re.MULTILINE,
-    )
-    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
-    text = re.sub(
-        r"^[ \t]*<([A-Za-z][\w-]*)\b[^>]*>.*?</\1[ \t]*>[ \t]*$",
-        "",
-        text,
-        flags=re.DOTALL | re.MULTILINE,
-    )
-    text = re.sub(r"^[ \t]*<[A-Za-z/!][^>]*>[ \t]*$", "", text, flags=re.MULTILINE)
-    return re.sub(r"<[^<>\n]{1,200}>", "", text)
-
-
-def _strip_inline(line: str) -> str:
-    """Reduce inline Markdown on one line to the words a reader would say."""
-    line = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", line)
-    line = re.sub(r"\[\^[^\]]+\]", "", line)
-    line = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", line)
-    line = re.sub(r"\[([^\]]*)\]\[[^\]]*\]", r"\1", line)
-    line = re.sub(r"`([^`]*)`", r"\1", line)
-    line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
-    line = re.sub(r"\*([^*]+)\*", r"\1", line)
-    line = re.sub(r"(?<![\w])__([^_]+)__(?![\w])", r"\1", line)
-    line = re.sub(r"(?<![\w])_([^_]+)_(?![\w])", r"\1", line)
-    line = re.sub(r"~~([^~]+)~~", r"\1", line)
-    return line
-
-
-def _speakable_line(line: str) -> str | None:
-    """Convert one Markdown line to prose, or None when it carries no speech."""
-    stripped = line.strip()
-    if not stripped:
-        return ""
-    if re.fullmatch(r"(\*\s*){3,}|(-\s*){3,}|(_\s*){3,}", stripped):
-        return None
-    if stripped.startswith("|"):
-        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
-        if all(re.fullmatch(r":?-{2,}:?", cell) for cell in cells if cell):
-            return None
-        return _strip_inline(", ".join(cell for cell in cells if cell))
-    stripped = re.sub(r"^#{1,6}[ \t]+", "", stripped)
-    stripped = re.sub(r"^>[ \t]?", "", stripped)
-    stripped = re.sub(r"^([-*+]|\d+\.)[ \t]+", "", stripped)
-    spoken = _strip_inline(stripped).strip()
-    return spoken if spoken else None
-
-
-def markdown_to_speech(text: str, *, section: str | None = None) -> str:
-    """Turn a Markdown document into paragraphs of speakable plain text.
-
-    Frontmatter, images, code blocks, HTML, link URLs, footnote markers and
-    bodies, and the closing italic author footer all come out. Heading text,
-    link text and table cells stay. Nothing else is expanded or rewritten.
-
-    Test: `test_markdown_to_speech_drops_frontmatter_and_footer`,
-    `test_markdown_to_speech_keeps_link_text_and_drops_code`
-    """
-    body = strip_frontmatter(text)
-    if section:
-        body = select_section(body, section)
-    body = _strip_blocks(body)
-
-    paragraphs: list[str] = []
-    current: list[str] = []
-    for raw in body.splitlines():
-        spoken = _speakable_line(raw)
-        if spoken is None:
-            continue
-        if spoken == "":
-            if current:
-                paragraphs.append(" ".join(current))
-                current = []
-            continue
-        current.append(spoken)
-    if current:
-        paragraphs.append(" ".join(current))
-
-    kept = [
-        re.sub(r"\s+", " ", paragraph).strip()
-        for paragraph in paragraphs
-        if not paragraph.startswith(AUTHOR_FOOTER_PREFIX)
-    ]
-    return "\n\n".join(paragraph for paragraph in kept if paragraph)
 
 
 # --- Chunking --------------------------------------------------------------
@@ -473,10 +349,40 @@ def load_manifest(path: Path) -> dict[str, dict]:
     return {str(record["index"]): record for record in records}
 
 
-def save_manifest(path: Path, records: dict[str, dict]) -> None:
-    """Write the manifest back in chunk order."""
+def manifest_lexicon(path: Path) -> str | None:
+    """The lexicon sha a previous run recorded, or None when it recorded none.
+
+    Test: `test_synthesise_records_the_lexicon_sha`
+    """
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text()).get("lexicon")
+
+
+def save_manifest(
+    path: Path,
+    records: dict[str, dict],
+    *,
+    lexicon: str | None = None,
+    reading: list[int] | None = None,
+) -> None:
+    """Write the manifest back in chunk order.
+
+    `chunks` is the work directory's whole cache, which outlives any one run.
+    `reading` names the subset this run actually read, so dropping a section
+    leaves its already-paid-for WAVs on disk without them re-entering the video;
+    `lexicon` records which respellings produced those texts.
+
+    Test: `test_save_manifest_records_the_reading_and_lexicon`
+    """
     ordered = [records[key] for key in sorted(records, key=int)]
-    path.write_text(json.dumps({"chunks": ordered}, indent=2) + "\n")
+    body: dict[str, object] = {}
+    if lexicon is not None:
+        body["lexicon"] = lexicon
+    if reading is not None:
+        body["reading"] = reading
+    body["chunks"] = ordered
+    path.write_text(json.dumps(body, indent=2) + "\n")
 
 
 def clone_part(
@@ -599,15 +505,35 @@ def _is_reusable(record: dict, chunk: Chunk, work_dir: Path) -> bool:
 
 
 def synthesise(
-    chunks: list[Chunk], work_dir: Path, options: argparse.Namespace, api_key: str
+    chunks: list[Chunk],
+    work_dir: Path,
+    options: argparse.Namespace,
+    api_key: str,
+    *,
+    lexicon: str | None = None,
 ) -> list[dict]:
     """Synthesise every chunk, skipping those the work directory already holds.
 
-    Test: `test_synthesise_resumes_from_manifest`
+    A lexicon change is detected by comparing `lexicon` with the sha the previous
+    run recorded, but it never invalidates a chunk on its own: respelling happens
+    before chunking, so a changed lexicon shows up as a changed chunk text, and
+    the per-chunk sha check already re-synthesises exactly those chunks and no
+    others. The comparison only says so out loud.
+
+    Test: `test_synthesise_resumes_from_manifest`,
+    `test_synthesise_redoes_only_the_chunks_a_lexicon_change_touched`
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = work_dir / "manifest.json"
+    previous = manifest_lexicon(manifest_path)
+    if lexicon is not None and previous is not None and previous != lexicon:
+        print(
+            f"pronunciation lexicon changed ({previous} -> {lexicon}); "
+            "re-synthesising every chunk whose text it altered",
+            file=sys.stderr,
+        )
     records = load_manifest(manifest_path)
+    reading = [chunk.index for chunk in chunks]
     for chunk in chunks:
         existing = records.get(str(chunk.index))
         if existing and _is_reusable(existing, chunk, work_dir):
@@ -618,8 +544,8 @@ def synthesise(
             file=sys.stderr,
         )
         records[str(chunk.index)] = synthesise_chunk(chunk, work_dir, options, api_key)
-        save_manifest(manifest_path, records)
-    save_manifest(manifest_path, records)
+        save_manifest(manifest_path, records, lexicon=lexicon, reading=reading)
+    save_manifest(manifest_path, records, lexicon=lexicon, reading=reading)
     return [records[str(chunk.index)] for chunk in chunks]
 
 
@@ -634,12 +560,35 @@ def report(records: list[dict], seconds: float, options: argparse.Namespace) -> 
     print(f"re-split chunks     : {resplit if resplit else 'none'}")
 
 
+def resolve_lexicon(options: argparse.Namespace) -> dict[str, str]:
+    """The pronunciation map this run applies, empty when it is switched off.
+
+    Test: `test_resolve_lexicon_is_empty_when_disabled`
+    """
+    if options.no_pronunciations:
+        return {}
+    return load_pronunciations(options.pronunciations)
+
+
+def speech_for(options: argparse.Namespace, lexicon: dict[str, str]) -> str:
+    """Reduce the input to spoken words: Markdown, then sections, then respelling.
+
+    Test: `test_speech_for_applies_the_lexicon_after_markdown`,
+    `test_speech_for_drops_a_named_section`
+    """
+    speech = markdown_to_speech(
+        options.input.read_text(encoding="utf-8"),
+        section=options.section,
+        drop_sections=options.drop_section,
+    )
+    return apply_pronunciations(speech, lexicon)
+
+
 def run(options: argparse.Namespace) -> int:
     started = time.perf_counter()
     api_key = runpod_clone.load_api_key(options.env_file)
-    speech = markdown_to_speech(
-        options.input.read_text(encoding="utf-8"), section=options.section
-    )
+    lexicon = resolve_lexicon(options)
+    speech = speech_for(options, lexicon)
     if not speech.strip():
         raise SystemExit("The input produced no speakable text.")
     chunks = chunk_text(
@@ -649,7 +598,9 @@ def run(options: argparse.Namespace) -> int:
     work_dir.mkdir(parents=True, exist_ok=True)
     (work_dir / "speech.txt").write_text(speech + "\n", encoding="utf-8")
 
-    records = synthesise(chunks, work_dir, options, api_key)
+    records = synthesise(
+        chunks, work_dir, options, api_key, lexicon=lexicon_sha(lexicon)
+    )
     seconds = concatenate(
         plan_gaps(
             records,
@@ -682,6 +633,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--section", help='Read one Markdown section, e.g. "## Script".'
+    )
+    parser.add_argument(
+        "--drop-section",
+        action="append",
+        default=[],
+        metavar="HEADING",
+        help='Remove a section and everything under it, e.g. "Related reading". '
+        "Repeat for more than one. Matches an ATX heading or a bold line.",
+    )
+    parser.add_argument(
+        "--pronunciations",
+        type=Path,
+        default=DEFAULT_PRONUNCIATIONS,
+        help="JSON map of written form to spoken respelling.",
+    )
+    parser.add_argument(
+        "--no-pronunciations",
+        action="store_true",
+        help="Read every word as written, applying no respellings.",
     )
     parser.add_argument("--word-budget", type=int, default=DEFAULT_WORD_BUDGET)
     parser.add_argument("--max-words", type=int, default=DEFAULT_MAX_WORDS)

@@ -11,9 +11,11 @@ What: reads the body work directory's `manifest.json`, gives each chunk one
 scene, cycles the supplied images across those scenes (hero first), and brackets
 them with an avatar scene for the intro audio and another for the closing.
 A chunk the reader had to re-split arrives as several part WAVs, so its parts are
-concatenated with the reader's own sentence gap. When the chunk count would push
-the video past `--max-scenes`, adjacent chunks are merged the same way — with the
-wider paragraph gap between them — and the merge is reported on stderr.
+concatenated with the reader's own sentence gap. Adjacent chunks are packed into
+one scene until it reaches `--scene-seconds`, joined the same way — with the wider
+paragraph gap between chunks that ended a paragraph — and `--max-scenes` merges
+further if the packed count still exceeds HeyGen's ceiling. Both are reported on
+stderr.
 
 Usage:
     python scripts/build_storyboard.py --intro-audio audio/intro.wav \\
@@ -48,25 +50,74 @@ def _load_reader():
 runpod_read = _load_reader()
 
 DEFAULT_MAX_SCENES = 50
+# Long enough that a 15-minute reading fits in ~30 scenes, short enough that a
+# still image never sits on screen past the point a viewer stops looking at it.
+DEFAULT_SCENE_SECONDS = 40.0
 
 
 def load_records(work_dir: Path) -> list[dict]:
-    """Return the work directory's chunk records in index order.
+    """Return the chunk records this reading covers, in index order.
 
-    Test: `test_load_records_orders_by_index`
+    A manifest written by a reader run carries `reading`, the indices that run
+    actually read. Dropping a section leaves its already-synthesised WAVs in
+    `chunks` — they cost money and a later run may want them back — so honouring
+    `reading` is what keeps them out of the video. A manifest without the key
+    predates it, and every chunk in it counts.
+
+    Test: `test_load_records_orders_by_index`,
+    `test_load_records_honours_the_reading_subset`
     """
     manifest = work_dir / "manifest.json"
     if not manifest.is_file():
         raise SystemExit(f"No manifest.json in {work_dir}.")
-    chunks = json.loads(manifest.read_text())["chunks"]
-    return sorted(chunks, key=lambda record: record["index"])
+    body = json.loads(manifest.read_text())
+    chunks = sorted(body["chunks"], key=lambda record: record["index"])
+    reading = body.get("reading")
+    if reading is None:
+        return chunks
+    wanted = set(reading)
+    return [record for record in chunks if record["index"] in wanted]
 
 
-def group_records(records: list[dict], max_groups: int) -> list[list[dict]]:
-    """Split chunks into at most `max_groups` contiguous, near-equal groups.
+def pack_records(records: list[dict], target_seconds: float) -> list[list[dict]]:
+    """Pack adjacent chunks into scenes of roughly `target_seconds` each.
 
-    Order is preserved and no chunk is dropped, so a merge only ever joins
-    neighbours. Under the ceiling every chunk keeps its own group.
+    Why: one scene per chunk gives a 15-minute reading 70 scenes, past HeyGen's
+    50-scene ceiling, and splitting by chunk count instead produces scenes from
+    5 s to 60 s because chunk length follows the source paragraphs. Packing by
+    duration is what puts every scene in the same range.
+
+    The rule: walk the chunks in order and start a new scene whenever adding the
+    next chunk would carry the current one past the target. A chunk is never
+    split, so a single chunk longer than the target becomes its own scene.
+
+    Test: `test_pack_records_fills_to_the_target`,
+    `test_pack_records_never_splits_a_chunk`
+    """
+    if target_seconds <= 0:
+        raise SystemExit("--scene-seconds must be positive.")
+    groups: list[list[dict]] = []
+    current: list[dict] = []
+    running = 0.0
+    for record in records:
+        seconds = float(record.get("duration") or 0.0)
+        if current and running + seconds > target_seconds:
+            groups.append(current)
+            current, running = [], 0.0
+        current.append(record)
+        running += seconds
+    if current:
+        groups.append(current)
+    return groups
+
+
+def group_records(records: list, max_groups: int) -> list[list]:
+    """Split a sequence into at most `max_groups` contiguous, near-equal groups.
+
+    Order is preserved and nothing is dropped, so a merge only ever joins
+    neighbours. Under the ceiling every item keeps its own group. Applied to
+    chunks it merges chunks; applied to packed scenes it merges scenes, which is
+    how `--max-scenes` stays a hard ceiling over `--scene-seconds`.
 
     Test: `test_group_records_keeps_one_chunk_per_group_when_it_fits`,
     `test_group_records_merges_adjacent_chunks`
@@ -77,13 +128,29 @@ def group_records(records: list[dict], max_groups: int) -> list[list[dict]]:
     if total <= max_groups:
         return [[record] for record in records]
     size, remainder = divmod(total, max_groups)
-    groups: list[list[dict]] = []
+    groups: list[list] = []
     start = 0
     for position in range(max_groups):
         stop = start + size + (1 if position < remainder else 0)
         groups.append(records[start:stop])
         start = stop
     return groups
+
+
+def plan_scenes(
+    records: list[dict], *, target_seconds: float, max_groups: int
+) -> list[list[dict]]:
+    """Pack chunks to the duration target, then merge further if still too many.
+
+    Test: `test_plan_scenes_falls_back_to_the_ceiling`
+    """
+    packed = pack_records(records, target_seconds)
+    if len(packed) <= max_groups:
+        return packed
+    return [
+        [record for scene in merged for record in scene]
+        for merged in group_records(packed, max_groups)
+    ]
 
 
 def cycle_images(images: list[Path], count: int) -> list[Path]:
@@ -219,12 +286,15 @@ def run(options: argparse.Namespace) -> int:
     """Read the manifest, write any merged WAVs, and save the storyboard."""
     records = load_records(options.body_dir)
     budget = options.max_scenes - 2
-    groups = group_records(records, budget)
+    groups = plan_scenes(
+        records, target_seconds=options.scene_seconds, max_groups=budget
+    )
     if len(groups) < len(records):
         print(
-            f"{len(records)} body chunks exceed the {budget}-scene budget "
-            f"({options.max_scenes} scenes less the two avatar scenes); merged "
-            f"adjacent chunks into {len(groups)} scenes.",
+            f"{len(records)} body chunks, {budget}-scene budget "
+            f"({options.max_scenes} scenes less the two avatar scenes); packed "
+            f"adjacent chunks to ~{options.scene_seconds:.0f}s into "
+            f"{len(groups)} scenes.",
             file=sys.stderr,
         )
     merged_dir = options.merged_dir or (options.output.parent / "merged")
@@ -286,6 +356,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--aspect-ratio", default="16:9")
     parser.add_argument("--resolution", default="1080p")
     parser.add_argument("--max-scenes", type=int, default=DEFAULT_MAX_SCENES)
+    parser.add_argument(
+        "--scene-seconds",
+        type=float,
+        default=DEFAULT_SCENE_SECONDS,
+        help="Pack adjacent chunks up to this many seconds per image scene.",
+    )
     parser.add_argument(
         "--sentence-gap-ms", type=int, default=runpod_read.DEFAULT_SENTENCE_GAP_MS
     )

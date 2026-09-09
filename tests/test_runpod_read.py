@@ -523,6 +523,149 @@ def test_manifest_records_the_required_fields(tmp_path, monkeypatch) -> None:
     assert record["duration"] == pytest.approx(1.0)
 
 
+# --- Pronunciation lexicon and section dropping ---------------------------
+
+
+def read_options(tmp_path: Path, document: str, **overrides) -> argparse.Namespace:
+    """A parsed reader command line over a one-file input."""
+    source = tmp_path / "input.md"
+    source.write_text(document, encoding="utf-8")
+    argv = [
+        "--endpoint-id",
+        "e1",
+        "--voice",
+        "bob",
+        "--input",
+        str(source),
+        "--output",
+        str(tmp_path / "out.wav"),
+    ]
+    for flag, value in overrides.items():
+        name = "--" + flag.replace("_", "-")
+        argv.append(name)
+        if value is not True:
+            argv.append(str(value))
+    return runpod_read.build_parser().parse_args(argv)
+
+
+def test_resolve_lexicon_reads_the_shipped_file_by_default(tmp_path: Path) -> None:
+    options = read_options(tmp_path, "Text.\n")
+
+    assert runpod_read.resolve_lexicon(options)["Matsuoka"] == "Mah-tsu-oh-ka"
+
+
+def test_resolve_lexicon_is_empty_when_disabled(tmp_path: Path) -> None:
+    options = read_options(tmp_path, "Text.\n", no_pronunciations=True)
+
+    assert runpod_read.resolve_lexicon(options) == {}
+
+
+def test_speech_for_applies_the_lexicon_after_markdown(tmp_path: Path) -> None:
+    """The link text survives the Markdown pass and is then respelled."""
+    options = read_options(tmp_path, "See [Matsuoka](https://example.com).\n")
+
+    speech = runpod_read.speech_for(options, runpod_read.resolve_lexicon(options))
+
+    assert speech == "See Mah-tsu-oh-ka."
+
+
+def test_speech_for_leaves_the_word_alone_with_no_pronunciations(
+    tmp_path: Path,
+) -> None:
+    options = read_options(tmp_path, "I'm Bob Matsuoka.\n", no_pronunciations=True)
+
+    speech = runpod_read.speech_for(options, runpod_read.resolve_lexicon(options))
+
+    assert speech == "I'm Bob Matsuoka."
+
+
+def test_speech_for_drops_a_named_section(tmp_path: Path) -> None:
+    document = "## Body\n\nSpoken.\n\n**Related reading:**\n- [A](https://a.example)\n"
+    options = read_options(tmp_path, document, drop_section="Related reading")
+
+    speech = runpod_read.speech_for(options, {})
+
+    assert speech == "Body\n\nSpoken."
+
+
+def test_save_manifest_records_the_reading_and_lexicon(tmp_path: Path) -> None:
+    path = tmp_path / "manifest.json"
+    records = {"0": {"index": 0}, "1": {"index": 1}}
+
+    runpod_read.save_manifest(path, records, lexicon="abc123", reading=[0])
+
+    body = json.loads(path.read_text())
+    assert body["lexicon"] == "abc123"
+    assert body["reading"] == [0]
+    assert [record["index"] for record in body["chunks"]] == [0, 1]
+
+
+def test_synthesise_records_the_lexicon_sha(tmp_path, monkeypatch) -> None:
+    stub = StubEndpoint(wav_bytes(1.0, tmp_path))
+    monkeypatch.setattr(runpod_read.runpod_clone, "submit", stub.submit)
+    work = tmp_path / "work"
+
+    runpod_read.synthesise(
+        [runpod_read.Chunk(0, "A chunk.", True)], work, options(), "k", lexicon="sha1"
+    )
+
+    assert runpod_read.manifest_lexicon(work / "manifest.json") == "sha1"
+
+
+def test_manifest_lexicon_is_none_for_a_manifest_without_one(tmp_path) -> None:
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps({"chunks": []}))
+
+    assert runpod_read.manifest_lexicon(path) is None
+
+
+def test_synthesise_redoes_only_the_chunks_a_lexicon_change_touched(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A new respelling must not re-buy audio for chunks that never said the word.
+
+    Respelling happens before chunking, so a lexicon change reaches the manifest
+    as a changed chunk sha. Only the chunk whose text moved is re-synthesised;
+    the rest stay cached, which is the difference between a few seconds of
+    endpoint time and a whole reading of it.
+    """
+    stub = StubEndpoint(wav_bytes(1.0, tmp_path))
+    monkeypatch.setattr(runpod_read.runpod_clone, "submit", stub.submit)
+    work = tmp_path / "work"
+    before = [
+        runpod_read.Chunk(0, "No surname here.", True),
+        runpod_read.Chunk(1, "I'm Bob Matsuoka.", True),
+    ]
+    runpod_read.synthesise(before, work, options(), "k", lexicon="lex-one")
+    assert stub.texts == ["No surname here.", "I'm Bob Matsuoka."]
+
+    stub.texts.clear()
+    after = [
+        runpod_read.Chunk(0, "No surname here.", True),
+        runpod_read.Chunk(1, "I'm Bob Mah-tsu-oh-ka.", True),
+    ]
+    runpod_read.synthesise(after, work, options(), "k", lexicon="lex-two")
+
+    assert stub.texts == ["I'm Bob Mah-tsu-oh-ka."]
+    assert runpod_read.manifest_lexicon(work / "manifest.json") == "lex-two"
+    assert "lexicon changed (lex-one -> lex-two)" in capsys.readouterr().err
+
+
+def test_synthesise_reuses_everything_when_the_lexicon_is_unchanged(
+    tmp_path, monkeypatch
+) -> None:
+    stub = StubEndpoint(wav_bytes(1.0, tmp_path))
+    monkeypatch.setattr(runpod_read.runpod_clone, "submit", stub.submit)
+    work = tmp_path / "work"
+    chunks = [runpod_read.Chunk(0, "I'm Bob Mah-tsu-oh-ka.", True)]
+    runpod_read.synthesise(chunks, work, options(), "k", lexicon="lex-one")
+
+    stub.texts.clear()
+    runpod_read.synthesise(chunks, work, options(), "k", lexicon="lex-one")
+
+    assert stub.texts == []
+
+
 # --- Summary --------------------------------------------------------------
 
 

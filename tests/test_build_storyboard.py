@@ -80,6 +80,54 @@ def test_load_records_orders_by_index(tmp_path):
     assert [r["index"] for r in build_storyboard.load_records(work_dir)] == [0, 1, 2]
 
 
+def test_load_records_honours_the_reading_subset(tmp_path):
+    """A dropped section's WAVs stay cached but must not become scenes."""
+    work_dir, records = make_work_dir(tmp_path, 4)
+    (work_dir / "manifest.json").write_text(
+        json.dumps({"reading": [0, 1, 2], "chunks": records})
+    )
+
+    kept = build_storyboard.load_records(work_dir)
+
+    assert [record["index"] for record in kept] == [0, 1, 2]
+
+
+def _fake(index: int, seconds: float) -> dict:
+    return {"index": index, "duration": seconds}
+
+
+def test_pack_records_fills_to_the_target():
+    """A scene grows until the next chunk would carry it past the target."""
+    records = [_fake(0, 12.0), _fake(1, 12.0), _fake(2, 12.0), _fake(3, 5.0)]
+
+    groups = build_storyboard.pack_records(records, 30.0)
+
+    assert [[r["index"] for r in g] for g in groups] == [[0, 1], [2, 3]]
+    assert [sum(r["duration"] for r in g) for g in groups] == [24.0, 17.0]
+
+
+def test_pack_records_never_splits_a_chunk():
+    """A chunk longer than the target becomes its own scene, not two."""
+    groups = build_storyboard.pack_records([_fake(0, 55.0), _fake(1, 4.0)], 30.0)
+
+    assert [[r["index"] for r in g] for g in groups] == [[0], [1]]
+
+
+def test_pack_records_rejects_a_non_positive_target():
+    with pytest.raises(SystemExit, match="must be positive"):
+        build_storyboard.pack_records([_fake(0, 1.0)], 0.0)
+
+
+def test_plan_scenes_falls_back_to_the_ceiling():
+    """`--max-scenes` still binds when the duration target packs too loosely."""
+    records = [_fake(index, 40.0) for index in range(10)]
+
+    scenes = build_storyboard.plan_scenes(records, target_seconds=40.0, max_groups=4)
+
+    assert len(scenes) == 4
+    assert [r["index"] for scene in scenes for r in scene] == list(range(10))
+
+
 def test_load_records_without_a_manifest_exits(tmp_path):
     with pytest.raises(SystemExit):
         build_storyboard.load_records(tmp_path)
@@ -290,6 +338,8 @@ def test_run_merges_when_the_scene_budget_is_tight(tmp_path, capsys):
             str(output),
             "--max-scenes",
             "6",
+            "--scene-seconds",
+            "1",
         ]
     )
     assert build_storyboard.run(options) == 0
@@ -297,7 +347,7 @@ def test_run_merges_when_the_scene_budget_is_tight(tmp_path, capsys):
     assert len(storyboard["scenes"]) == 6
     body = [scene for scene in storyboard["scenes"] if scene["role"] == "body"]
     assert [scene["chunks"] for scene in body] == [[0, 1, 2], [3, 4], [5, 6], [7, 8]]
-    assert "merged adjacent chunks into 4 scenes" in capsys.readouterr().err
+    assert "into 4 scenes" in capsys.readouterr().err
 
 
 def test_run_keeps_one_scene_per_chunk_when_they_fit(tmp_path):
@@ -319,6 +369,8 @@ def test_run_keeps_one_scene_per_chunk_when_they_fit(tmp_path):
             "look_1",
             "--output",
             str(output),
+            "--scene-seconds",
+            "1",
         ]
     )
     assert build_storyboard.run(options) == 0
