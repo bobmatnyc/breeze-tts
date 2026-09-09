@@ -8,6 +8,12 @@ on:
   push:
     branches:
       - feat/runpod-serverless
+    # A rebuild takes five minutes and moves the :latest tag, so documentation
+    # alone should not trigger one. Use workflow_dispatch to force a build.
+    paths-ignore:
+      - "**/*.md"
+      - LICENSE
+      - assets/**
 
 concurrency:
   group: serverless-image-${{ github.ref }}
