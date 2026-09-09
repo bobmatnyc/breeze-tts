@@ -46,7 +46,7 @@ CHANNELS = 1
 
 DEFAULT_WORD_BUDGET = 70
 # 12.6 decode steps per second of audio against a 1500-step ceiling is ~115 s.
-# At a measured ~150 words per minute, 110 words is ~44 s — comfortably clear.
+# The voice reads at a measured ~165 words per minute, so 110 words is ~40 s.
 DEFAULT_MAX_WORDS = 110
 DEFAULT_SENTENCE_GAP_MS = 350
 DEFAULT_PARAGRAPH_GAP_MS = 700
