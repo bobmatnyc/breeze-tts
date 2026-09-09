@@ -118,6 +118,32 @@ def test_markdown_to_speech_drops_footnote_marker_and_body() -> None:
     assert "nobody reads aloud" not in speech
 
 
+def test_markdown_to_speech_drops_reference_link_definitions() -> None:
+    """`[label]: url "Title"` is machinery for `[text][label]`, never speech."""
+    document = (
+        "Delegation is a skill, as the [2001 study][study] showed.\n\n"
+        '[study]: https://example.com/paper.pdf "The 2001 Study"\n'
+        "[plain]: http://example.org/other\n"
+        "[angle]: <https://example.net/spaced> 'Single quoted'\n"
+    )
+
+    speech = runpod_read.markdown_to_speech(document)
+
+    assert speech == "Delegation is a skill, as the 2001 study showed."
+    assert "example.com" not in speech
+    assert "example.org" not in speech
+    assert "example.net" not in speech
+
+
+def test_markdown_to_speech_keeps_a_colon_inside_a_sentence() -> None:
+    """The definition rule must not eat prose that merely contains brackets."""
+    document = "The tag [draft]: a working title, stays in the sentence.\n"
+
+    speech = runpod_read.markdown_to_speech(document)
+
+    assert "a working title, stays in the sentence" in speech
+
+
 def test_markdown_to_speech_reads_table_rows_without_pipes() -> None:
     speech = runpod_read.markdown_to_speech(ARTICLE)
 
@@ -412,6 +438,67 @@ def test_synthesise_redoes_a_chunk_whose_wav_vanished(tmp_path, monkeypatch) -> 
     runpod_read.synthesise(chunks, work, options(), "k")
 
     assert stub.texts == ["Only chunk."]
+
+
+def test_synthesise_redoes_a_chunk_whose_wav_is_truncated(
+    tmp_path, monkeypatch
+) -> None:
+    """A header-only WAV marked done in the manifest must not pass resume.
+
+    The regression: `_is_reusable` checked only that the file existed, so an
+    interrupted synthesis left a chunk that resume skipped and `concatenate`
+    contributed nothing to — a reading silently short by one chunk, exit 0.
+    """
+    stub = StubEndpoint(wav_bytes(1.0, tmp_path))
+    monkeypatch.setattr(runpod_read.runpod_clone, "submit", stub.submit)
+    work = tmp_path / "work"
+    chunks = [runpod_read.Chunk(0, "Only chunk.", True)]
+    runpod_read.synthesise(chunks, work, options(), "k")
+
+    part = work / "chunk_0000_p00.wav"
+    write_wav(part, 0.0)  # header intact, payload gone
+    manifest = json.loads((work / "manifest.json").read_text())
+    assert manifest["chunks"][0]["parts"][0]["duration"] == 1.0
+
+    stub.texts.clear()
+    records = runpod_read.synthesise(chunks, work, options(), "k")
+
+    assert stub.texts == ["Only chunk."], "the truncated chunk was not re-synthesised"
+    planned = runpod_read.plan_gaps(
+        records, work, sentence_gap_ms=350, paragraph_gap_ms=700
+    )
+    seconds = runpod_read.concatenate(planned, tmp_path / "out.wav")
+    assert seconds > 0.0, "the reading concatenated to silence"
+
+
+def test_part_is_intact_rejects_a_header_only_wav(tmp_path) -> None:
+    path = write_wav(tmp_path / "empty.wav", 0.0)
+    assert runpod_read._part_is_intact(path, 1.0) is False
+
+
+def test_part_is_intact_rejects_a_duration_mismatch(tmp_path) -> None:
+    path = write_wav(tmp_path / "short.wav", 0.5)
+    assert runpod_read._part_is_intact(path, 1.0) is False
+    assert runpod_read._part_is_intact(path, 0.5) is True
+
+
+def test_part_is_intact_accepts_a_record_without_a_duration(tmp_path) -> None:
+    path = write_wav(tmp_path / "part.wav", 0.5)
+    assert runpod_read._part_is_intact(path, None) is True
+
+
+def test_part_is_intact_rejects_a_missing_file(tmp_path) -> None:
+    assert runpod_read._part_is_intact(tmp_path / "absent.wav", 1.0) is False
+
+
+def test_read_pcm_rejects_a_truncated_payload(tmp_path) -> None:
+    """A WAV whose data chunk is shorter than its header claims must not read."""
+    path = write_wav(tmp_path / "cut.wav", 1.0)
+    whole = path.read_bytes()
+    path.write_bytes(whole[: len(whole) - 8000])
+
+    with pytest.raises(SystemExit):
+        runpod_read.read_pcm(path)
 
 
 def test_manifest_records_the_required_fields(tmp_path, monkeypatch) -> None:

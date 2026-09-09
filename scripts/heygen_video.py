@@ -61,9 +61,18 @@ CONTENT_TYPES = {
 }
 SCENE_AUDIO_KEY = "audio_asset_id"
 TERMINAL_STATES = frozenset({"completed", "failed"})
+# A 429 or a 5xx is worth retrying; a 4xx that is not 429 is a request the
+# server will refuse again however long we wait.
+RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+MAX_ATTEMPTS = 5
+BACKOFF_BASE_S = 2.0
+# Past this, honouring the server's own Retry-After would outlast the caller.
+MAX_RETRY_AFTER_S = 120.0
 
-# (status, headers, body) in, (status_code, body_bytes) out.
-Transport = Callable[[str, str, dict[str, str], bytes | None], tuple[int, bytes]]
+# (method, url, headers, body) in, (status_code, headers, body_bytes) out.
+Transport = Callable[
+    [str, str, dict[str, str], bytes | None], tuple[int, dict[str, str], bytes]
+]
 
 
 class HeyGenError(RuntimeError):
@@ -85,23 +94,43 @@ class HeyGenError(RuntimeError):
 
 def urllib_transport(
     method: str, url: str, headers: dict[str, str], body: bytes | None
-) -> tuple[int, bytes]:
+) -> tuple[int, dict[str, str], bytes]:
     """Send one request with the standard library, returning status and bytes.
 
     An HTTP error is a response, not an exception, because the caller wants the
-    error body. Only a transport failure propagates.
+    error body and its `Retry-After`. Only a transport failure propagates.
     """
     request = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=300) as response:
-            return response.status, response.read()
+            return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as error:
-        return error.code, error.read()
+        return error.code, dict(error.headers or {}), error.read()
 
 
 def auth_headers(api_key: str) -> dict[str, str]:
     """Headers every v3 call needs. A plain user agent keeps proxies happy."""
     return {"X-Api-Key": api_key, "User-Agent": "breeze-tts-heygen/1.0"}
+
+
+def retry_delay(headers: dict[str, str], attempt: int) -> float:
+    """Seconds to wait before the next attempt.
+
+    The server's `Retry-After` wins when it sends one, capped so a wild value
+    cannot park the caller; otherwise back off exponentially from the base.
+
+    Test: `test_retry_delay_honours_retry_after`,
+    `test_retry_delay_backs_off_exponentially`
+    """
+    raw = next(
+        (value for key, value in headers.items() if key.lower() == "retry-after"), None
+    )
+    if raw:
+        try:
+            return min(max(float(raw), 0.0), MAX_RETRY_AFTER_S)
+        except ValueError:
+            pass  # A HTTP-date Retry-After falls through to the backoff.
+    return BACKOFF_BASE_S * (2 ** (attempt - 1))
 
 
 def call(
@@ -113,10 +142,17 @@ def call(
     json_body: dict | None = None,
     extra_headers: dict[str, str] | None = None,
     raw_body: bytes | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict:
     """Make one v3 call and return the `data` object, raising on any non-2xx.
 
-    Test: `test_call_raises_with_the_response_body`
+    A 429 or 5xx is retried up to `MAX_ATTEMPTS` times with exponential backoff,
+    or after the server's own `Retry-After` when it sends one. Every other
+    non-2xx raises on the first response, because waiting will not fix it.
+
+    Test: `test_call_raises_with_the_response_body`,
+    `test_call_retries_a_429_then_succeeds`,
+    `test_call_gives_up_after_max_attempts`
     """
     url = f"{API_ROOT}{path}"
     headers = auth_headers(api_key)
@@ -125,11 +161,21 @@ def call(
         headers["Content-Type"] = "application/json"
         body = json.dumps(json_body).encode("utf-8")
     headers.update(extra_headers or {})
-    status, payload = transport(method, url, headers, body)
-    if not 200 <= status < 300:
-        raise HeyGenError(method, url, status, payload)
-    parsed = json.loads(payload or b"{}")
-    return parsed.get("data", parsed)
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        status, response_headers, payload = transport(method, url, headers, body)
+        if 200 <= status < 300:
+            parsed = json.loads(payload or b"{}")
+            return parsed.get("data", parsed)
+        if status not in RETRY_STATUSES or attempt == MAX_ATTEMPTS:
+            raise HeyGenError(method, url, status, payload)
+        delay = retry_delay(response_headers, attempt)
+        print(
+            f"{method} {url} -> HTTP {status}; retrying in {delay:.1f}s "
+            f"(attempt {attempt} of {MAX_ATTEMPTS})",
+            file=sys.stderr,
+        )
+        sleep(delay)
+    raise AssertionError("unreachable: the loop either returns or raises")
 
 
 # --- Credentials -----------------------------------------------------------
@@ -433,20 +479,34 @@ def command_status(options: argparse.Namespace) -> int:
     return 0 if data.get("status") == "completed" else 1
 
 
-def fetch_to_file(url: str, output: Path) -> int:
-    """Stream a presigned URL to disk, returning the byte count."""
+def fetch_to_file(
+    url: str, output: Path, opener: Callable = urllib.request.urlopen
+) -> int:
+    """Stream a presigned URL to disk, returning the byte count.
+
+    Why: a 76 MB download that dies halfway used to leave a truncated MP4 at the
+    final path, which every later check reads as "already downloaded". The bytes
+    land in a sibling `.part` file and only become the target once the stream
+    finishes, so an interruption leaves the target absent rather than wrong.
+
+    Test: `test_fetch_to_file_leaves_nothing_behind_on_failure`,
+    `test_fetch_to_file_replaces_the_target_on_success`
+    """
     output.parent.mkdir(parents=True, exist_ok=True)
     request = urllib.request.Request(
         url, headers={"User-Agent": "breeze-tts-heygen/1.0"}
     )
-    with (
-        urllib.request.urlopen(request, timeout=600) as response,
-        output.open("wb") as sink,
-    ):
-        written = 0
-        for block in iter(lambda: response.read(1 << 20), b""):
-            sink.write(block)
-            written += len(block)
+    partial = output.with_name(output.name + ".part")
+    written = 0
+    try:
+        with opener(request, timeout=600) as response, partial.open("wb") as sink:
+            for block in iter(lambda: response.read(1 << 20), b""):
+                sink.write(block)
+                written += len(block)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    os.replace(partial, output)
     return written
 
 

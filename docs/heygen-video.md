@@ -46,6 +46,11 @@ python scripts/runpod_read.py --endpoint-id 53bev6svysh8g4 --voice bob \
   --word-budget 80 --seed 42 --env-file .env.local
 ```
 
+Resume validates the audio it finds, not just its filename: a re-run re-reads
+every part WAV in the work directory and re-synthesises any chunk whose file is
+empty, truncated, or a different length from the duration the manifest recorded.
+An interrupted reading therefore cannot come back one chunk short.
+
 Build the storyboard from the intro audio, the body work directory, the closing
 audio and the images.
 

@@ -53,6 +53,9 @@ DEFAULT_PARAGRAPH_GAP_MS = 700
 # RTX 4090 at $1.10/hr, the most expensive tier in the endpoint's GPU pool.
 DEFAULT_RATE_PER_SECOND = 0.000306
 MAX_RESPLIT_DEPTH = 3
+# The worker's reported seconds and the WAV it sent agree exactly on every
+# reading on record, so this only absorbs float rounding in the manifest.
+PART_DURATION_TOLERANCE_S = 0.05
 
 AUTHOR_FOOTER_PREFIX = "Bob Matsuoka is CTO"
 
@@ -99,11 +102,18 @@ def select_section(text: str, heading: str) -> str:
 
 
 def _strip_blocks(text: str) -> str:
-    """Remove fenced code, HTML and footnote definitions.
+    """Remove fenced code, HTML, footnote definitions and link definitions.
 
     An HTML element that starts its own line is a block — a figure, an embed,
     a caption — so it goes entirely, contents included. A tag sitting inside a
     sentence loses only the tag, because the words around it are still prose.
+
+    A reference link definition — `[label]: https://… "Title"` on its own line —
+    is machinery for the `[text][label]` form, never speech, so the whole line
+    goes. `_strip_inline` cannot do it: with no parentheses and no second
+    bracket, the line matches none of its link rules and the URL is read aloud.
+
+    Test: `test_markdown_to_speech_drops_reference_link_definitions`
     """
     text = re.sub(
         r"^[ \t]*(```|~~~).*?^[ \t]*\1[ \t]*$",
@@ -112,6 +122,13 @@ def _strip_blocks(text: str) -> str:
         flags=re.DOTALL | re.MULTILINE,
     )
     text = re.sub(r"^\[\^[^\]]+\]:.*(?:\n[ \t]+\S.*)*\n?", "", text, flags=re.MULTILINE)
+    text = re.sub(
+        r"^[ \t]{0,3}\[[^\^\]][^\]]*\]:[ \t]*<?\S+>?"
+        r"(?:[ \t]+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?[ \t]*$\n?",
+        "",
+        text,
+        flags=re.MULTILINE,
+    )
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
     text = re.sub(
         r"^[ \t]*<([A-Za-z][\w-]*)\b[^>]*>.*?</\1[ \t]*>[ \t]*$",
@@ -338,9 +355,15 @@ def text_sha(text: str) -> str:
 
 
 def read_pcm(path: Path) -> bytes:
-    """Read a chunk WAV, refusing anything but 24 kHz mono 16-bit.
+    """Read a chunk WAV, refusing anything but a complete 24 kHz mono 16-bit file.
 
-    Test: `test_read_pcm_rejects_a_mismatched_format`
+    Why: `wave.readframes` hands back whatever bytes are present when a file was
+    truncated mid-write, with no error. A part WAV cut short by a crashed or
+    interrupted run then reads back as valid-but-short, and the finished reading
+    silently loses that speech while exiting 0.
+
+    Test: `test_read_pcm_rejects_a_mismatched_format`,
+    `test_read_pcm_rejects_a_truncated_payload`
     """
     with wave.open(str(path), "rb") as handle:
         actual = (handle.getnchannels(), handle.getsampwidth(), handle.getframerate())
@@ -348,7 +371,14 @@ def read_pcm(path: Path) -> bytes:
             raise SystemExit(
                 f"{path} is {actual}, expected {(CHANNELS, SAMPLE_WIDTH, SAMPLE_RATE)}."
             )
-        return handle.readframes(handle.getnframes())
+        frames = handle.getnframes()
+        data = handle.readframes(frames)
+    expected = frames * SAMPLE_WIDTH * CHANNELS
+    if len(data) != expected:
+        raise SystemExit(
+            f"{path} holds {len(data)} bytes of audio; its header claims {expected}."
+        )
+    return data
 
 
 def silence(milliseconds: int) -> bytes:
@@ -530,12 +560,42 @@ def synthesise_chunk(
     }
 
 
+def _part_is_intact(path: Path, expected_seconds: float | None) -> bool:
+    """True when a part WAV decodes whole and is as long as the manifest says.
+
+    Why: existence is not enough. A zero-frame or truncated WAV satisfies
+    `is_file()`, so resume treats a chunk that never finished as done and the
+    reading loses it. Rejecting it here re-synthesises that chunk instead.
+
+    Test: `test_part_is_intact_rejects_a_header_only_wav`,
+    `test_part_is_intact_rejects_a_duration_mismatch`
+    """
+    if not path.is_file():
+        return False
+    try:
+        data = read_pcm(path)
+    except (SystemExit, wave.Error, EOFError, OSError):
+        return False
+    seconds = len(data) / (SAMPLE_RATE * SAMPLE_WIDTH * CHANNELS)
+    if seconds <= 0:
+        return False
+    if expected_seconds is None:
+        return True
+    return abs(seconds - expected_seconds) <= PART_DURATION_TOLERANCE_S
+
+
 def _is_reusable(record: dict, chunk: Chunk, work_dir: Path) -> bool:
-    """True when a manifest record still matches the chunk and its WAVs exist."""
+    """True when a manifest record still matches the chunk and its WAVs are whole.
+
+    Test: `test_synthesise_resumes_from_manifest`,
+    `test_synthesise_redoes_a_chunk_whose_wav_is_truncated`
+    """
     if record.get("sha") != text_sha(chunk.text) or record.get("truncated"):
         return False
     parts = record.get("parts") or []
-    return bool(parts) and all((work_dir / part["wav"]).is_file() for part in parts)
+    return bool(parts) and all(
+        _part_is_intact(work_dir / part["wav"], part.get("duration")) for part in parts
+    )
 
 
 def synthesise(

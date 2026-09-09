@@ -32,7 +32,7 @@ heygen_video = _load_module()
 class StubTransport:
     """A transport that replays canned responses and records what it was sent."""
 
-    def __init__(self, responses: list[tuple[int, bytes]]) -> None:
+    def __init__(self, responses: list[tuple[int, dict, bytes]]) -> None:
         self.responses = list(responses)
         self.calls: list[tuple[str, str, dict, bytes | None]] = []
 
@@ -41,9 +41,15 @@ class StubTransport:
         return self.responses.pop(0)
 
 
-def ok(payload: dict) -> tuple[int, bytes]:
+def ok(payload: dict) -> tuple[int, dict, bytes]:
     """A 200 carrying HeyGen's usual `data` wrapper."""
-    return 200, json.dumps({"data": payload}).encode()
+    return 200, {}, json.dumps({"data": payload}).encode()
+
+
+def error(status: int, message: str, headers: dict | None = None):
+    """A non-2xx carrying HeyGen's usual `error` object."""
+    body = json.dumps({"error": {"code": "e", "message": message}}).encode()
+    return status, headers or {}, body
 
 
 # --- Credentials and content types -----------------------------------------
@@ -92,13 +98,66 @@ def test_content_type_rejects_an_unsupported_suffix():
 
 
 def test_call_raises_with_the_response_body():
-    transport = StubTransport(
-        [(400, b'{"error":{"code":"bad_request","message":"avatar_id required"}}')]
-    )
+    transport = StubTransport([error(400, "avatar_id required")])
     with pytest.raises(heygen_video.HeyGenError) as caught:
         heygen_video.call(transport, "POST", "/videos", "key", json_body={})
     assert "avatar_id required" in str(caught.value)
     assert caught.value.status == 400
+
+
+def test_call_does_not_retry_a_plain_client_error():
+    transport = StubTransport([error(400, "avatar_id required"), ok({"video_id": "x"})])
+    with pytest.raises(heygen_video.HeyGenError):
+        heygen_video.call(transport, "POST", "/videos", "key", json_body={})
+    assert len(transport.calls) == 1
+
+
+def test_call_retries_a_429_then_succeeds():
+    slept: list[float] = []
+    transport = StubTransport(
+        [
+            error(429, "slow down", {"Retry-After": "3"}),
+            error(503, "upstream busy"),
+            ok({"video_id": "vid_9"}),
+        ]
+    )
+    data = heygen_video.call(
+        transport, "POST", "/videos", "key", json_body={}, sleep=slept.append
+    )
+    assert data == {"video_id": "vid_9"}
+    assert len(transport.calls) == 3
+    # The 429's Retry-After wins; the 503 has none, so attempt 2 backs off 4 s.
+    assert slept == [3.0, 4.0]
+
+
+def test_call_gives_up_after_max_attempts():
+    slept: list[float] = []
+    transport = StubTransport([error(500, "boom")] * heygen_video.MAX_ATTEMPTS)
+    with pytest.raises(heygen_video.HeyGenError) as caught:
+        heygen_video.call(transport, "GET", "/videos/v", "key", sleep=slept.append)
+    assert caught.value.status == 500
+    assert len(transport.calls) == heygen_video.MAX_ATTEMPTS
+    assert len(slept) == heygen_video.MAX_ATTEMPTS - 1
+
+
+def test_retry_delay_honours_retry_after():
+    assert heygen_video.retry_delay({"Retry-After": "7"}, 1) == 7.0
+    assert heygen_video.retry_delay({"retry-after": "7"}, 3) == 7.0
+    capped = heygen_video.retry_delay({"Retry-After": "99999"}, 1)
+    assert capped == heygen_video.MAX_RETRY_AFTER_S
+
+
+def test_retry_delay_backs_off_exponentially():
+    assert [heygen_video.retry_delay({}, attempt) for attempt in (1, 2, 3)] == [
+        2.0,
+        4.0,
+        8.0,
+    ]
+    # An HTTP-date Retry-After is not a number, so the backoff still applies.
+    assert (
+        heygen_video.retry_delay({"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}, 1)
+        == 2.0
+    )
 
 
 def test_call_unwraps_the_data_object():
@@ -343,6 +402,52 @@ def test_render_dry_run_submits_nothing(tmp_path, monkeypatch, capsys):
     assert options.handler(options) == 0
     assert transport.calls == []
     assert json.loads(capsys.readouterr().out)["type"] == "studio"
+
+
+class StubStream:
+    """A response body that yields `blocks`, then optionally raises mid-stream."""
+
+    def __init__(self, blocks: list[bytes], fail_after: int | None = None) -> None:
+        self.blocks = list(blocks)
+        self.fail_after = fail_after
+        self.served = 0
+
+    def read(self, _size):
+        if self.fail_after is not None and self.served == self.fail_after:
+            raise ConnectionResetError("connection reset mid-stream")
+        if not self.blocks:
+            return b""
+        self.served += 1
+        return self.blocks.pop(0)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+def test_fetch_to_file_replaces_the_target_on_success(tmp_path):
+    target = tmp_path / "nested" / "video.mp4"
+    stream = StubStream([b"abc", b"def"])
+    written = heygen_video.fetch_to_file(
+        "https://example/x.mp4", target, opener=lambda *_a, **_k: stream
+    )
+    assert written == 6
+    assert target.read_bytes() == b"abcdef"
+    assert not target.with_name("video.mp4.part").exists()
+
+
+def test_fetch_to_file_leaves_nothing_behind_on_failure(tmp_path):
+    target = tmp_path / "video.mp4"
+    stream = StubStream([b"abc", b"def"], fail_after=1)
+    with pytest.raises(ConnectionResetError):
+        heygen_video.fetch_to_file(
+            "https://example/x.mp4", target, opener=lambda *_a, **_k: stream
+        )
+    assert not target.exists()
+    assert not target.with_name("video.mp4.part").exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 class FakeClock:
