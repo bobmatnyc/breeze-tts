@@ -7,9 +7,10 @@ then per job prepare inputs, stream chunks, and return a base64 WAV.
 
 What: resolves the checkpoint on the network volume (downloading it from Hugging
 Face on first boot), loads it via ``load_runtime``, and registers ``handler``
-with ``runpod.serverless.start``. A job is
-``{text, ref_audio_b64, ref_text, seed?, cfg_scale?}`` and the reply is
-``{audio_b64, sample_rate, ...timings}``.
+with ``runpod.serverless.start``. A job carries an ``op`` — ``clone`` (the
+default), ``register_voice``, ``list_voices`` or ``delete_voice`` — and a clone
+takes either a registered ``voice`` name or an inline ``ref_audio_b64`` plus
+``ref_text``.
 
 Test: ``tests/test_rp_handler.py``
 """
@@ -18,17 +19,19 @@ from __future__ import annotations
 
 import base64
 import binascii
-import io
 import math
 import os
 import tempfile
 import time
 import uuid
-import wave
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from serverless.locking import is_complete, publish_directory, volume_lock
+from serverless.registry import RegistryError, VoiceRegistry, validate_name
+from serverless.wav import AudioError, decode_wav, encode_wav
 
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -38,6 +41,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_VOLUME_ROOT = "/runpod-volume"
 DEFAULT_HF_REPO = "BreezeBlue/breeze-tts-2"
 CHECKPOINT_DIR_NAME = "breeze-tts-2"
+CHECKPOINT_LOCK_NAME = ".breeze-checkpoint.lock"
 
 # Mirrors infer.py:25-27 and breeze_infer/api.py:37-39.
 MAX_NEW_TOKENS = 1500
@@ -50,90 +54,22 @@ DEFAULT_CFG_SCALE = 1.0
 MAX_REF_AUDIO_BYTES = 6 * 1024 * 1024
 MAX_TEXT_CHARS = 5000
 
+OPERATIONS = ("clone", "register_voice", "list_voices", "delete_voice")
+
 
 class InputError(ValueError):
     """A job input the worker rejects before touching the GPU."""
 
 
-# --------------------------------------------------------------------------
-# WAV helpers
-# --------------------------------------------------------------------------
-
-
-def encode_wav(audio: np.ndarray, sample_rate: int) -> bytes:
-    """Serialize mono float32 PCM in [-1, 1] as a 16-bit WAV container.
-
-    Test: `test_encode_wav_roundtrips_through_decode`
-    """
-    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
-    clipped = np.clip(samples, -1.0, 1.0)
-    pcm = (clipped * 32767.0).astype("<i2", copy=False)
-    buffer = io.BytesIO()
-    with wave.open(buffer, "wb") as handle:
-        handle.setnchannels(1)
-        handle.setsampwidth(2)
-        handle.setframerate(int(sample_rate))
-        handle.writeframes(pcm.tobytes())
-    return buffer.getvalue()
-
-
-def decode_wav(payload: bytes) -> tuple[np.ndarray, int]:
-    """Read a WAV byte string as mono float32 PCM plus its sample rate.
-
-    Why: ``encode_prompt_audio`` (``breeze_infer/audio.py:13-22``) reads a path
-    with ``soundfile`` and downmixes to mono, so the reference must arrive as a
-    file soundfile can open. Parsing here first turns a malformed upload into a
-    clear job error instead of a stack trace deep in the tokenizer.
-
-    What: uses the stdlib ``wave`` reader for 8/16/32-bit PCM, and falls back to
-    ``soundfile`` for anything else it cannot parse (float WAV, 24-bit, FLAC).
-
-    Test: `test_decode_wav_reads_stereo_as_mono`, `test_decode_wav_rejects_garbage`
-    """
-    try:
-        with wave.open(io.BytesIO(payload), "rb") as handle:
-            channels = handle.getnchannels()
-            width = handle.getsampwidth()
-            sample_rate = handle.getframerate()
-            frames = handle.readframes(handle.getnframes())
-    except (wave.Error, EOFError) as exc:
-        return _decode_wav_via_soundfile(payload, exc)
-
-    dtypes = {1: np.uint8, 2: "<i2", 4: "<i4"}
-    if width not in dtypes:
-        return _decode_wav_via_soundfile(
-            payload, ValueError(f"unsupported sample width {width}")
-        )
-
-    raw = np.frombuffer(frames, dtype=dtypes[width])
-    if width == 1:
-        samples = (raw.astype(np.float32) - 128.0) / 128.0
-    else:
-        samples = raw.astype(np.float32) / float(2 ** (8 * width - 1))
-
-    if channels > 1:
-        usable = (samples.size // channels) * channels
-        samples = samples[:usable].reshape(-1, channels).mean(axis=1)
-    return np.ascontiguousarray(samples, dtype=np.float32), int(sample_rate)
-
-
-def _decode_wav_via_soundfile(
-    payload: bytes, cause: Exception
-) -> tuple[np.ndarray, int]:
-    try:
-        import soundfile as sf
-    except ImportError:
-        raise InputError(f"ref_audio_b64 is not a readable WAV: {cause}") from cause
-
-    try:
-        data, sample_rate = sf.read(
-            io.BytesIO(payload), always_2d=True, dtype="float32"
-        )
-    except Exception as exc:
-        raise InputError(f"ref_audio_b64 is not readable audio: {exc}") from exc
-    return np.ascontiguousarray(np.mean(data, axis=1), dtype=np.float32), int(
-        sample_rate
-    )
+# Re-exported so callers and tests have one import site for the audio helpers.
+__all__ = [
+    "AudioError",
+    "InputError",
+    "decode_wav",
+    "encode_wav",
+    "handler",
+    "resolve_checkpoint",
+]
 
 
 # --------------------------------------------------------------------------
@@ -141,51 +77,40 @@ def _decode_wav_via_soundfile(
 # --------------------------------------------------------------------------
 
 
-def validate_job_input(job_input: Any) -> dict[str, Any]:
-    """Normalize a job payload into the fields the clone path needs.
+def _require_text(job_input: dict[str, Any], field: str, *, limit: int) -> str:
+    value = job_input.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise InputError(f"'{field}' is required and must be a non-empty string.")
+    if len(value) > limit:
+        raise InputError(f"'{field}' exceeds {limit} characters.")
+    return value
 
-    Preconditions the caller must meet: ``text`` and ``ref_text`` are non-blank
-    strings, ``ref_audio_b64`` is base64-encoded WAV under
-    ``MAX_REF_AUDIO_BYTES``, ``seed`` is an int, and ``cfg_scale`` is exactly
-    1.0 — the ``ref_clone_tata`` template defines no negative prompt
-    (``breeze_infer/templates.py:120-124``), so ``prepare_inputs`` rejects any
-    other guidance scale (``breeze_infer/templates.py:342-346``).
 
-    Test: `test_validate_job_input_accepts_minimal_payload`,
-    `test_validate_job_input_rejects_bad_fields`
-
-    Returns the decoded reference audio alongside the scalar fields.
-    """
-    if not isinstance(job_input, dict):
-        raise InputError("Job input must be a JSON object.")
-
-    text = job_input.get("text")
-    if not isinstance(text, str) or not text.strip():
-        raise InputError("'text' is required and must be a non-empty string.")
-    if len(text) > MAX_TEXT_CHARS:
-        raise InputError(f"'text' exceeds {MAX_TEXT_CHARS} characters.")
-
-    ref_text = job_input.get("ref_text")
-    if not isinstance(ref_text, str) or not ref_text.strip():
-        raise InputError(
-            "'ref_text' is required and must be the transcript of 'ref_audio_b64'."
-        )
-
-    ref_audio_b64 = job_input.get("ref_audio_b64")
-    if not isinstance(ref_audio_b64, str) or not ref_audio_b64.strip():
+def _decode_reference_audio(job_input: dict[str, Any]) -> tuple[np.ndarray, int]:
+    encoded = job_input.get("ref_audio_b64")
+    if not isinstance(encoded, str) or not encoded.strip():
         raise InputError("'ref_audio_b64' is required and must be a base64 WAV string.")
     try:
-        ref_audio = base64.b64decode(ref_audio_b64, validate=True)
+        payload = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise InputError(f"'ref_audio_b64' is not valid base64: {exc}") from exc
-    if not ref_audio:
+    if not payload:
         raise InputError("'ref_audio_b64' decoded to zero bytes.")
-    if len(ref_audio) > MAX_REF_AUDIO_BYTES:
+    if len(payload) > MAX_REF_AUDIO_BYTES:
         raise InputError(
-            f"'ref_audio_b64' decodes to {len(ref_audio)} bytes, over the "
+            f"'ref_audio_b64' decodes to {len(payload)} bytes, over the "
             f"{MAX_REF_AUDIO_BYTES} byte limit. Send a shorter reference clip."
         )
+    try:
+        samples, sample_rate = decode_wav(payload)
+    except AudioError as exc:
+        raise InputError(str(exc)) from exc
+    if samples.size == 0:
+        raise InputError("'ref_audio_b64' contains no audio frames.")
+    return samples, sample_rate
 
+
+def _validate_scalars(job_input: dict[str, Any]) -> tuple[int, float]:
     seed = job_input.get("seed", DEFAULT_SEED)
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise InputError("'seed' must be an integer.")
@@ -201,19 +126,96 @@ def validate_job_input(job_input: Any) -> dict[str, Any]:
             "'cfg_scale' must be 1.0 for voice cloning: the ref_clone_tata "
             "template defines no negative prompt, so guidance is unavailable."
         )
+    return seed, cfg_scale
 
-    samples, sample_rate = decode_wav(ref_audio)
-    if samples.size == 0:
-        raise InputError("'ref_audio_b64' contains no audio frames.")
 
-    return {
+def validate_job_input(job_input: Any) -> dict[str, Any]:
+    """Normalize a job payload and dispatch it to the right operation's shape.
+
+    Preconditions: ``op`` is one of ``OPERATIONS`` (default ``clone``). A clone
+    supplies exactly one voice source — a registered ``voice`` name, or an
+    inline ``ref_audio_b64`` plus ``ref_text`` pair. ``cfg_scale`` must be 1.0;
+    the ``ref_clone_tata`` template defines no negative prompt
+    (``breeze_infer/templates.py:120-124``), so ``prepare_inputs`` rejects any
+    other guidance scale (``breeze_infer/templates.py:342-346``).
+
+    Test: `test_validate_job_input_accepts_minimal_payload`,
+    `test_validate_job_input_rejects_bad_fields`,
+    `test_clone_requires_exactly_one_voice_source`
+    """
+    if not isinstance(job_input, dict):
+        raise InputError("Job input must be a JSON object.")
+
+    op = job_input.get("op", "clone")
+    if op not in OPERATIONS:
+        raise InputError(f"'op' must be one of {list(OPERATIONS)}; got {op!r}.")
+
+    if op == "list_voices":
+        return {"op": op}
+
+    if op == "delete_voice":
+        try:
+            return {"op": op, "name": validate_name(job_input.get("name"))}
+        except RegistryError as exc:
+            raise InputError(str(exc)) from exc
+
+    if op == "register_voice":
+        try:
+            name = validate_name(job_input.get("name"))
+        except RegistryError as exc:
+            raise InputError(str(exc)) from exc
+        ref_text = _require_text(job_input, "ref_text", limit=MAX_TEXT_CHARS)
+        samples, sample_rate = _decode_reference_audio(job_input)
+        overwrite = job_input.get("overwrite", False)
+        if not isinstance(overwrite, bool):
+            raise InputError("'overwrite' must be a boolean.")
+        return {
+            "op": op,
+            "name": name,
+            "ref_text": ref_text.strip(),
+            "ref_samples": samples,
+            "ref_sample_rate": sample_rate,
+            "overwrite": overwrite,
+            "source_filename": job_input.get("source_filename"),
+        }
+
+    text = _require_text(job_input, "text", limit=MAX_TEXT_CHARS)
+    seed, cfg_scale = _validate_scalars(job_input)
+
+    has_voice = "voice" in job_input and job_input["voice"] is not None
+    has_inline = any(
+        job_input.get(field) is not None for field in ("ref_audio_b64", "ref_text")
+    )
+    if has_voice and has_inline:
+        raise InputError(
+            "Provide either 'voice' or the 'ref_audio_b64'/'ref_text' pair, not both."
+        )
+    if not has_voice and not has_inline:
+        raise InputError(
+            "A clone needs a voice source: either 'voice' naming a registered "
+            "voice, or 'ref_audio_b64' with its 'ref_text'."
+        )
+
+    request: dict[str, Any] = {
+        "op": op,
         "text": text,
-        "ref_text": ref_text.strip(),
-        "ref_samples": samples,
-        "ref_sample_rate": sample_rate,
         "seed": seed,
         "cfg_scale": cfg_scale,
     }
+    if has_voice:
+        try:
+            request["voice"] = validate_name(job_input["voice"])
+        except RegistryError as exc:
+            raise InputError(str(exc)) from exc
+        return request
+
+    request["ref_text"] = _require_text(
+        job_input, "ref_text", limit=MAX_TEXT_CHARS
+    ).strip()
+    request["ref_samples"], request["ref_sample_rate"] = _decode_reference_audio(
+        job_input
+    )
+    return request
 
 
 # --------------------------------------------------------------------------
@@ -221,49 +223,66 @@ def validate_job_input(job_input: Any) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+def _download_checkpoint(repo_id: str, destination: Path) -> None:
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(
+        repo_id=repo_id,
+        local_dir=str(destination),
+        max_workers=8,
+        token=os.environ.get("HF_TOKEN") or None,
+    )
+    if not (destination / "audio_tokenizer").is_dir():
+        raise RuntimeError(
+            f"{repo_id} downloaded to {destination} but has no audio_tokenizer/ "
+            "directory, which load_runtime requires."
+        )
+
+
 def resolve_checkpoint(
     volume_root: str | Path = DEFAULT_VOLUME_ROOT,
     repo_id: str = DEFAULT_HF_REPO,
+    download: Any = None,
 ) -> Path:
-    """Return a checkpoint directory, downloading it to the volume if absent.
+    """Return a complete checkpoint directory, downloading it once if absent.
 
     Why: a fresh network volume is empty, and a separate seeding pod is one more
-    thing to provision and forget. The worker seeds itself on first boot and
-    every later cold start finds the weights already there.
+    thing to provision and forget. The worker seeds itself on first boot.
 
-    What: treats ``<volume_root>/breeze-tts-2/audio_tokenizer`` as the presence
-    marker, since ``load_runtime`` hard-fails without it
-    (``breeze_infer/runtime.py:99-105``).
+    What: readiness is the completion marker written after a successful
+    download, not the presence of ``audio_tokenizer/``. ``snapshot_download``
+    populates the tree incrementally, so a worker killed mid-download would
+    otherwise leave a directory that looks finished forever. The download runs
+    into a staging directory under an ``flock``, so a second worker cold-starting
+    on the same volume waits for the first rather than racing it, and an
+    interrupted attempt is discarded and retried on the next start.
 
-    Test: `test_resolve_checkpoint_uses_existing_directory`
+    Test: `test_resolve_checkpoint_uses_existing_directory`,
+    `test_resolve_checkpoint_rejects_partial_download`,
+    `test_resolve_checkpoint_retries_after_interrupted_download`
     """
     override = os.environ.get("BREEZE_CHECKPOINT_DIR")
     if override:
         return Path(override)
 
-    target = Path(volume_root) / CHECKPOINT_DIR_NAME
-    if (target / "audio_tokenizer").is_dir():
+    fetch = download or (lambda destination: _download_checkpoint(repo_id, destination))
+    root = Path(volume_root)
+    target = root / CHECKPOINT_DIR_NAME
+    if is_complete(target):
         print(f"checkpoint present at {target}", flush=True)
         return target
 
-    from huggingface_hub import snapshot_download
-
-    print(f"checkpoint missing at {target}; downloading {repo_id}", flush=True)
-    started = time.perf_counter()
-    target.mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo_id=repo_id,
-        local_dir=str(target),
-        max_workers=8,
-        token=os.environ.get("HF_TOKEN") or None,
-    )
-    print(
-        f"checkpoint download: {time.perf_counter() - started:.2f} s -> {target}",
-        flush=True,
-    )
-    if not (target / "audio_tokenizer").is_dir():
-        raise RuntimeError(
-            f"{repo_id} downloaded to {target} but has no audio_tokenizer/ directory."
+    with volume_lock(root / CHECKPOINT_LOCK_NAME):
+        # Another worker may have finished while this one waited for the lock.
+        if is_complete(target):
+            print(f"checkpoint completed by another worker at {target}", flush=True)
+            return target
+        print(f"checkpoint missing at {target}; downloading {repo_id}", flush=True)
+        started = time.perf_counter()
+        publish_directory(target, fetch)
+        print(
+            f"checkpoint download: {time.perf_counter() - started:.2f} s -> {target}",
+            flush=True,
         )
     return target
 
@@ -314,6 +333,9 @@ def load_state() -> dict[str, Any]:
         "runtime": runtime,
         "load_seconds": load_seconds,
         "checkpoint": str(checkpoint),
+        "registry": VoiceRegistry(
+            os.environ.get("BREEZE_VOLUME_ROOT", DEFAULT_VOLUME_ROOT)
+        ),
     }
 
 
@@ -325,25 +347,32 @@ STATE: dict[str, Any] | None = (
 
 
 # --------------------------------------------------------------------------
-# Handler
+# Generation
 # --------------------------------------------------------------------------
 
 
-def handler(job: dict[str, Any]) -> dict[str, Any]:
-    """Generate one cloned utterance and return it as a base64 WAV.
+def _reference_for(request: dict[str, Any], workdir: Path) -> tuple[Path, str]:
+    """Materialize the reference clip the clone path reads from disk."""
+    if "voice" in request:
+        voice = STATE["registry"].get(request["voice"])
+        return voice.reference_path, voice.ref_text
 
-    Test: `test_handler_returns_wav_with_stubbed_runtime`,
-    `test_handler_reports_validation_error`
+    path = workdir / "reference.wav"
+    path.write_bytes(encode_wav(request["ref_samples"], request["ref_sample_rate"]))
+    return path, request["ref_text"]
+
+
+def _generate(request: dict[str, Any], request_id: str) -> dict[str, Any]:
+    """Run one clone and return the response body.
+
+    Truncation: ``iter_audio_chunks`` ends on EOS, on ``max_new_tokens``, or on
+    ``max_seq_len`` (``models/fast_streaming.py:850-854,878``), and every path
+    sets ``is_final`` on the last chunk, so ``is_final`` cannot tell them apart.
+    The token observer fires once per decode step, so the step count can: a run
+    that reached either ceiling was cut off mid-utterance.
+
+    Test: `test_handler_reports_truncation_at_the_token_ceiling`
     """
-    started = time.perf_counter()
-    try:
-        request = validate_job_input(job.get("input"))
-    except InputError as exc:
-        return {"error": str(exc)}
-
-    if STATE is None:
-        return {"error": "Model is not loaded in this worker."}
-
     from breeze_infer.runtime import set_all_seeds
     from breeze_infer.templates import (
         get_template,
@@ -351,21 +380,17 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         select_template_name,
     )
 
+    started = time.perf_counter()
     runtime = STATE["runtime"]
-    request_id = job.get("id") or f"rp-{uuid.uuid4().hex}"
 
     with tempfile.TemporaryDirectory(prefix="breeze_ref_") as workdir:
-        reference_path = Path(workdir) / "reference.wav"
-        reference_path.write_bytes(
-            encode_wav(request["ref_samples"], request["ref_sample_rate"])
-        )
-
+        reference_path, ref_text = _reference_for(request, Path(workdir))
         job_request = {
             "id": request_id,
             "text": request["text"],
             "speaker": "S0",
             "ref_audio_path": str(reference_path),
-            "ref_text": request["ref_text"],
+            "ref_text": ref_text,
         }
         set_all_seeds(request["seed"])
         inputs = prepare_inputs(
@@ -380,12 +405,21 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         )
         prepare_seconds = time.perf_counter() - started
 
+        steps = 0
+
+        def count_step(_frame: Any) -> None:
+            nonlocal steps
+            steps += 1
+
         generation_started = time.perf_counter()
         set_all_seeds(request["seed"])
         pieces = [
             np.asarray(chunk.audio, dtype=np.float32).reshape(-1)
             for chunk in runtime.iter_audio_chunks(
-                inputs, request_id=request_id, seed=request["seed"]
+                inputs,
+                request_id=request_id,
+                seed=request["seed"],
+                token_observer=count_step,
             )
         ]
         generation_seconds = time.perf_counter() - generation_started
@@ -394,23 +428,81 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     if audio.size == 0:
         return {"error": "Model produced no audio for this request."}
 
+    prompt_tokens = _prompt_length(inputs)
+    truncated = steps >= MAX_NEW_TOKENS or (
+        prompt_tokens is not None and prompt_tokens + steps >= MAX_SEQ_LEN - 1
+    )
+
     sample_rate = int(runtime.sample_rate)
     wav = encode_wav(audio, sample_rate)
     audio_seconds = audio.size / sample_rate
     print(
         f"request {request_id}: prepare={prepare_seconds:.2f}s "
         f"generate={generation_seconds:.2f}s audio={audio_seconds:.2f}s "
-        f"rtf={generation_seconds / audio_seconds:.3f}",
+        f"steps={steps} truncated={truncated}",
         flush=True,
     )
     return {
         "audio_b64": base64.b64encode(wav).decode("ascii"),
         "sample_rate": sample_rate,
         "audio_seconds": round(audio_seconds, 3),
+        "truncated": truncated,
+        "decode_steps": steps,
         "prepare_seconds": round(prepare_seconds, 3),
         "generation_seconds": round(generation_seconds, 3),
         "model_load_seconds": round(STATE["load_seconds"], 3),
     }
+
+
+def _prompt_length(inputs: Any) -> int | None:
+    """Prompt token count, used for the max_seq_len truncation check."""
+    try:
+        return int(inputs["input_ids"].shape[1])
+    except (AttributeError, KeyError, IndexError, TypeError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# Handler
+# --------------------------------------------------------------------------
+
+
+def handler(job: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch one job to its operation and return a JSON-serializable reply.
+
+    Test: `test_handler_returns_wav_with_stubbed_runtime`,
+    `test_handler_reports_validation_error`, `test_handler_registers_a_voice`
+    """
+    try:
+        request = validate_job_input(job.get("input"))
+    except InputError as exc:
+        return {"error": str(exc)}
+
+    if STATE is None:
+        return {"error": "Model is not loaded in this worker."}
+
+    registry: VoiceRegistry = STATE["registry"]
+    request_id = job.get("id") or f"rp-{uuid.uuid4().hex}"
+
+    try:
+        if request["op"] == "list_voices":
+            return {"voices": registry.list_voices()}
+        if request["op"] == "delete_voice":
+            return registry.delete(request["name"])
+        if request["op"] == "register_voice":
+            return {
+                "voice": registry.register(
+                    request["name"],
+                    audio=request["ref_samples"],
+                    sample_rate=request["ref_sample_rate"],
+                    ref_text=request["ref_text"],
+                    overwrite=request["overwrite"],
+                    source_filename=request["source_filename"],
+                )
+            }
+        return _generate(request, request_id)
+    except (RegistryError, AudioError) as exc:
+        return {"error": str(exc)}
 
 
 if __name__ == "__main__":

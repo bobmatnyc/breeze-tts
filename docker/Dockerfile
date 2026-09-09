@@ -52,7 +52,9 @@ RUN python docker/smoke_check.py \
         tests/test_logits_process.py \
         tests/test_rp_handler.py \
         tests/test_runpod_clone.py \
+        tests/test_serverless_locking.py \
         tests/test_templates.py \
+        tests/test_voice_registry.py \
         tests/test_warmup_profile.py
 
 ENTRYPOINT ["/opt/breeze-infer/docker/entrypoint.sh"]

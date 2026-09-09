@@ -1,0 +1,6 @@
+# Dependencies for scripts/openai_shim.py only. The shim talks HTTP to the
+# RunPod endpoint and never loads the model, so it shares nothing with
+# requirements.txt and runs on a python-slim base.
+starlette==0.51.1
+uvicorn==0.41.1
+requests==2.34.2

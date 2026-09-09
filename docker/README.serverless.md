@@ -30,8 +30,14 @@ Flash-attention is off for serverless because nothing selects it: both
 also removes the only reason for the `-devel` base. `docker/smoke_check.py`
 treats `flash_attn` as optional, so the gated build still runs its own gate.
 
-`docker/build.sh` and `docker/run.sh` are unchanged — the defaults keep the
-pod/dev image byte-identical to before.
+`docker/build.sh` and `docker/run.sh` are unchanged, and with the default args
+the pod/dev image installs exactly what it did before — same base, same
+flash-attn build, no serverless dependencies. One thing does differ: the default
+`CMD` is now `python -u rp_handler.py` instead of `python -m breeze_infer.api
+--help`. `CMD` cannot be varied by a build arg without an entrypoint shim, and
+the pod path never reaches it — `docker/run.sh:18` passes an explicit
+`python -m breeze_infer.api …` command that overrides `CMD` on every run. So the
+change is to a default the pod path does not use, not to how it behaves.
 
 Build locally:
 
@@ -146,17 +152,31 @@ the constraint is explicit rather than implied.
 
 ## Model weights
 
-The worker looks for `/runpod-volume/breeze-tts-2/audio_tokenizer` — the
-directory `load_runtime` hard-fails without (`breeze_infer/runtime.py:99-105`).
-If it is missing, the worker downloads `BreezeBlue/breeze-tts-2` from Hugging
-Face into the volume before loading, so the first cold start seeds itself and no
-separate seeding pod is needed. The repository is public and ungated; no
+The worker keeps the checkpoint at `/runpod-volume/breeze-tts-2/`, downloading
+`BreezeBlue/breeze-tts-2` from Hugging Face on first boot so it seeds itself and
+no separate seeding pod is needed. The repository is public and ungated; no
 `HF_TOKEN` is required. Set `BREEZE_CHECKPOINT_DIR` to load from somewhere else.
+
+Readiness is the `.breeze-complete` marker written after a successful download,
+not the presence of `audio_tokenizer/` — the directory `load_runtime` hard-fails
+without (`breeze_infer/runtime.py:99-105`). `snapshot_download` populates the
+tree incrementally, so a worker killed mid-download would otherwise leave a
+checkpoint that looks finished forever. The download runs into a staging
+directory under an `flock` on the volume and is renamed into place only when it
+completes, so a concurrent worker waits rather than racing and an interrupted
+attempt is discarded and retried on the next start.
 
 ## Invoking it
 
 ```bash
-python scripts/runpod_clone.py \
+# A registered voice (see "Named voices" below):
+python scripts/runpod_clone.py clone \
+  --endpoint-id 53bev6svysh8g4 --voice bob \
+  --text "This is a test of voice cloning using my actual voice recordings" \
+  --output outputs/clone.wav
+
+# Or an inline reference clip:
+python scripts/runpod_clone.py clone \
   --endpoint-id 53bev6svysh8g4 \
   --text "This is a test of voice cloning using my actual voice recordings" \
   --ref-audio outputs/Recording_1_ref20.wav \
@@ -173,14 +193,15 @@ alongside the worker's model-load and generation timings.
 ### Request and response
 
 ```jsonc
-// input
-{ "text": "...", "ref_audio_b64": "<base64 WAV>", "ref_text": "...",
+// input — exactly one of "voice" or the ref_audio_b64/ref_text pair
+{ "op": "clone", "text": "...", "voice": "bob",
   "seed": 42, "cfg_scale": 1.0 }
 
 // output
 { "audio_b64": "<base64 WAV>", "sample_rate": 24000,
-  "audio_seconds": 4.4, "prepare_seconds": 0.124,
-  "generation_seconds": 13.046, "model_load_seconds": 4.664 }
+  "audio_seconds": 4.4, "truncated": false, "decode_steps": 331,
+  "prepare_seconds": 0.124, "generation_seconds": 13.046,
+  "model_load_seconds": 4.664 }
 ```
 
 `cfg_scale` must be 1.0. The `ref_clone_tata` template defines no negative
@@ -251,6 +272,112 @@ next deployment re-downloads it.
 
 Leaving the endpoint in place costs nothing while idle. The volume keeps
 billing, so delete it too if the deployment is finished for good.
+
+## Named voices
+
+Sending a multi-megabyte reference clip on every request is wasteful when the
+same speaker repeats, and an OpenAI-style client has nowhere to put one — it
+sends a voice *name*. Registering a voice once turns every later request into a
+short JSON body.
+
+Voices live on the network volume under `/runpod-volume/voices/<name>/`, each
+holding `reference.wav`, `transcript.txt` and a `meta.json` recording the
+creation time, source filename, duration, sample rate and the SHA-256 of the
+WAV. Names must match `[a-z0-9_-]{1,32}` — they become path segments and travel
+in request bodies, so the character set is narrower than merely path-safe.
+
+Writes take an `flock` on the volume and build into a staging directory that is
+renamed into place, with a `.breeze-complete` marker written last. A worker
+killed mid-write therefore leaves a directory with no marker, which reads as
+absent rather than as a usable voice. The checkpoint download uses the same
+discipline, so a second worker cold-starting on a fresh volume waits for the
+first rather than racing it.
+
+```bash
+python scripts/runpod_clone.py register --endpoint-id <id> \
+  --name bob \
+  --ref-audio outputs/Recording_1_ref40.wav \
+  --ref-text "<exact transcript>" [--overwrite]
+
+python scripts/runpod_clone.py list   --endpoint-id <id>
+python scripts/runpod_clone.py delete --endpoint-id <id> --name bob
+python scripts/runpod_clone.py clone  --endpoint-id <id> \
+  --voice bob --text "Hello" --output outputs/hello.wav
+```
+
+The job `input` carries an `op`: `clone` (the default), `register_voice`,
+`list_voices`, `delete_voice`. A clone takes **exactly one** voice source —
+either `voice` or the `ref_audio_b64`/`ref_text` pair; supplying both or neither
+is an error. An unknown voice name fails closed with a message listing what is
+registered.
+
+## Truncation
+
+`iter_audio_chunks` stops on end-of-speech, on `max_new_tokens`, or on
+`max_seq_len` (`models/fast_streaming.py:850-854,878`). Every path marks the
+last chunk `is_final`, so that flag cannot tell a finished utterance from a
+severed one. The worker counts decode steps through the token observer instead
+and returns `truncated` alongside `decode_steps`; the client prints a warning
+when it is true, and the shim sets an `X-Truncated` response header.
+
+## OpenAI-compatible route
+
+`scripts/openai_shim.py` is a small Starlette app exposing
+`POST /v1/audio/speech` in OpenAI's shape, so any tool that lets you override
+the OpenAI base URL can drive this endpoint. It loads no model and talks HTTP to
+RunPod, so it runs anywhere.
+
+```bash
+SHIM_API_KEY=<token you invent> RUNPOD_ENDPOINT_ID=<endpoint id> \
+  bash scripts/run_shim.sh          # http://127.0.0.1:8080
+```
+
+`RUNPOD_API_KEY` and `RUNPOD_ENDPOINT_ID` come from the environment or
+`.env.local`. `SHIM_API_KEY` is the bearer token callers must present; the shim
+refuses to serve without one configured, since it is meant to sit on a network.
+`docker/Dockerfile.shim` builds it on `python:3.12-slim` with ffmpeg, a few tens
+of megabytes rather than several gigabytes.
+
+Request mapping:
+
+| OpenAI field | Handling |
+| --- | --- |
+| `model` | Accepted and ignored — this server has one model |
+| `input` | The text to speak, capped at 5000 characters |
+| `voice` | A name in the registry above |
+| `response_format` | `wav` and `mp3`; default `mp3` per OpenAI. `opus`, `aac`, `flac` and `pcm` are refused rather than silently served as something else |
+| `speed` | Rejected with 400 unless it is exactly 1.0 |
+
+`speed` is refused because nothing in the generation path takes a rate or
+duration parameter — `FastStreamingConfig` (`models/fast_streaming.py`) has no
+such field — so accepting it would mean ignoring it. MP3 comes from ffmpeg,
+which the image already installs; no maintained pure-python MP3 *encoder*
+exists, only decoders. Inputs over 600 characters are queued through `/run` and
+polled, since a cold worker can outlast the `/runsync` window.
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/audio/speech \
+  -H "Authorization: Bearer $SHIM_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"tts-1","input":"Hello there.","voice":"bob","response_format":"wav"}' \
+  --output hello.wav
+```
+
+### Pointing Open WebUI at it
+
+Settings → Audio → Text-to-Speech:
+
+| Field | Value |
+| --- | --- |
+| Text-to-Speech Engine | OpenAI |
+| API Base URL | `http://<shim host>:8080/v1` |
+| API Key | the `SHIM_API_KEY` value |
+| TTS Model | `tts-1` (any string; it is ignored) |
+| TTS Voice | `bob`, or any registered name |
+
+Open WebUI requests `mp3` by default, which the shim serves. Register a voice
+before setting this up: the shim has no upload path, by design — a voice is
+registered once through `scripts/runpod_clone.py`.
 
 ## Live test on record
 
