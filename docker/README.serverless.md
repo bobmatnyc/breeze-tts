@@ -397,6 +397,13 @@ through the `idleTimeout` between sequential requests. Read the estimate as the
 generation floor, not the invoice. The deltas also carry the network volume's
 continuous charge and anything else on the account at the time.
 
+### From a reading to a video
+
+`docs/heygen-video.md` picks the reading up where this section leaves off:
+`scripts/build_storyboard.py` turns a work directory's chunk WAVs into a scene
+list, and `scripts/heygen_video.py` uploads the assets and drives HeyGen's v3
+API to a finished MP4. It carries the credit measurements from the test run.
+
 ## OpenAI-compatible route
 
 `scripts/openai_shim.py` is a small Starlette app exposing
