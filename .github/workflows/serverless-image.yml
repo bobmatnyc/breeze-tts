@@ -66,6 +66,12 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:${{ github.sha }}
             ${{ env.IMAGE }}:latest
+          # Links the GHCR package to this repository, so the package inherits
+          # the repository's access. RunPod pulls anonymously, so the package
+          # must end up public.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
 
       - name: Report image reference
         run: |
