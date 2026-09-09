@@ -327,6 +327,83 @@ severed one. The worker counts decode steps through the token observer instead
 and returns `truncated` alongside `decode_steps`; the client prints a warning
 when it is true, and the shim sets an `X-Truncated` response header.
 
+## Reading long texts
+
+`scripts/runpod_read.py` reads a whole document aloud. It strips Markdown to
+speakable prose, splits it at sentence boundaries under a word budget, clones
+each chunk through the same endpoint with one fixed seed, and joins the chunk
+WAVs with a silence gap that widens at paragraph breaks. The result is one
+24 kHz mono 16-bit WAV.
+
+```bash
+# One section of a document — the heading names it.
+python scripts/runpod_read.py --endpoint-id 53bev6svysh8g4 --voice bob \
+  --input path/to/video-intro.md --section "## Script" \
+  --output outputs/hyperdev_delegation_intro_bob.wav \
+  --work-dir outputs/reads/hyperdev_delegation_intro_bob
+
+# A whole article, with an MP3 alongside.
+python scripts/runpod_read.py --endpoint-id 53bev6svysh8g4 --voice bob \
+  --input path/to/final.md \
+  --output outputs/hyperdev_delegation_article_bob.wav \
+  --work-dir outputs/reads/hyperdev_delegation_article_bob --mp3
+```
+
+Frontmatter, images, code blocks, HTML blocks, link URLs, footnote markers and
+bodies, and a closing italic author footer all come out; heading text, link
+text and table cells stay. Nothing else is expanded or rewritten, so a symbol
+the author wrote for the eye — an arrow in `idea -> communication -> outcome`,
+say — reaches the model as written.
+
+Chunks default to a 70-word budget with a 110-word hard cap, which is about
+44 s of speech against the roughly 115 s the token ceiling allows. Only a
+single sentence longer than the cap is ever cut, at clause boundaries. When the
+worker still answers `truncated: true`, the reader halves that chunk at a
+sentence boundary and retries, up to three times.
+
+The work directory holds one WAV per request plus `manifest.json`, which
+records each chunk's index, text, SHA, duration, `executionTime` and
+`truncated` flag. A re-run resynthesises only chunks whose text changed or
+whose WAV is missing, so an interrupted reading resumes where it stopped.
+`--mp3` transcodes through ffmpeg and says so and skips when ffmpeg is absent.
+
+Useful knobs: `--word-budget` and `--max-words` for chunk size,
+`--sentence-gap-ms` (350) and `--paragraph-gap-ms` (700) for the joins,
+`--seed` for reproducibility, and `--rate-per-second` for the cost line, which
+defaults to the RTX 4090 tier.
+
+### Two readings on record
+
+Both against endpoint `53bev6svysh8g4` with the registered `bob` voice, seed 42
+and the shipped defaults. No chunk needed re-splitting in either.
+
+| Reading | Chunks | Audio | Endpoint execute | Balance delta |
+|---|---|---|---|---|
+| `## Script` of the HyperDev video intro | 10 | 114.96 s | 242.2 s | $0.041 |
+| The HyperDev delegation article, whole | 72 | 977.88 s | 2006.7 s | $0.751 |
+
+Generation ran at 2.16 s of worker time per second of speech, slower than the
+single-request figure above because every chunk pays its own prepare step. The
+model reads at about 165 words per minute, so a 110-word chunk is roughly 40 s
+of speech.
+
+Wall time is longer than execution time: 401.7 s and 2180.2 s respectively, for
+a cold start on the first request plus the 2 s `/status` poll interval on every
+one after it.
+
+The balance delta runs above the printed cost estimate — $0.751 against $0.614
+for the article — because RunPod bills worker runtime, and a worker stays up
+through the `idleTimeout` between sequential requests. Read the estimate as the
+generation floor, not the invoice. The deltas also carry the network volume's
+continuous charge and anything else on the account at the time.
+
+### From a reading to a video
+
+`docs/heygen-video.md` picks the reading up where this section leaves off:
+`scripts/build_storyboard.py` turns a work directory's chunk WAVs into a scene
+list, and `scripts/heygen_video.py` uploads the assets and drives HeyGen's v3
+API to a finished MP4. It carries the credit measurements from the test run.
+
 ## OpenAI-compatible route
 
 `scripts/openai_shim.py` is a small Starlette app exposing

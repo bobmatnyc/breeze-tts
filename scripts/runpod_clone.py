@@ -8,7 +8,8 @@ writes returned audio to disk.
 What: four subcommands — `clone`, `register`, `list`, `delete`. A clone takes
 either `--voice <name>` for a registered voice or `--ref-audio` with
 `--ref-text`. Requests go to `/runsync` by default and to `/run` plus `/status`
-polling with `--async`.
+polling with `--async`; a `/runsync` call that comes back still queued falls
+through to the same polling rather than failing.
 
 Usage:
     python scripts/runpod_clone.py register --endpoint-id <id> \\
@@ -95,6 +96,34 @@ def _headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
 
+def poll_status(
+    endpoint_id: str,
+    api_key: str,
+    job_id: str,
+    *,
+    timeout: int,
+    poll_seconds: float = 2.0,
+) -> dict[str, object]:
+    """Poll `/status/<job_id>` until the job reaches a terminal status.
+
+    Test: `test_poll_status_returns_terminal_body`
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        status = requests.get(
+            f"{BASE_URL}/{endpoint_id}/status/{job_id}",
+            headers=_headers(api_key),
+            timeout=60,
+        )
+        status.raise_for_status()
+        body = status.json()
+        if body.get("status") in TERMINAL_STATUSES:
+            return body
+        if time.monotonic() >= deadline:
+            raise SystemExit(f"Job {job_id} did not finish within {timeout}s.")
+        time.sleep(poll_seconds)
+
+
 def submit(
     endpoint_id: str,
     api_key: str,
@@ -104,7 +133,16 @@ def submit(
     use_async: bool,
     poll_seconds: float = 2.0,
 ) -> dict[str, object]:
-    """Run a job, blocking on `/runsync` or polling `/status` after `/run`."""
+    """Run a job, blocking on `/runsync` or polling `/status` after `/run`.
+
+    A throttled pool answers `/runsync` with `IN_QUEUE` or `IN_PROGRESS` and a
+    job id rather than a finished job, so the synchronous path falls through to
+    the same `/status` polling the async path uses instead of treating a
+    non-terminal body as the result.
+
+    Test: `test_submit_polls_when_runsync_returns_in_queue`,
+    `test_submit_returns_terminal_runsync_body`
+    """
     if not use_async:
         response = requests.post(
             f"{BASE_URL}/{endpoint_id}/runsync",
@@ -113,7 +151,23 @@ def submit(
             timeout=timeout,
         )
         response.raise_for_status()
-        return response.json()
+        body = response.json()
+        if body.get("status") in TERMINAL_STATUSES:
+            return body
+        job_id = body.get("id")
+        if not job_id:
+            return body
+        print(
+            f"/runsync returned {body.get('status')}; polling job {job_id}",
+            file=sys.stderr,
+        )
+        return poll_status(
+            endpoint_id,
+            api_key,
+            str(job_id),
+            timeout=timeout,
+            poll_seconds=poll_seconds,
+        )
 
     submitted = requests.post(
         f"{BASE_URL}/{endpoint_id}/run",
@@ -124,20 +178,9 @@ def submit(
     submitted.raise_for_status()
     job_id = submitted.json()["id"]
     print(f"queued job {job_id}", file=sys.stderr)
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        status = requests.get(
-            f"{BASE_URL}/{endpoint_id}/status/{job_id}",
-            headers=_headers(api_key),
-            timeout=60,
-        )
-        status.raise_for_status()
-        body = status.json()
-        if body.get("status") in TERMINAL_STATUSES:
-            return body
-        time.sleep(poll_seconds)
-    raise SystemExit(f"Job {job_id} did not finish within {timeout}s.")
+    return poll_status(
+        endpoint_id, api_key, job_id, timeout=timeout, poll_seconds=poll_seconds
+    )
 
 
 def summarize(body: dict[str, object]) -> None:
@@ -152,7 +195,7 @@ def summarize(body: dict[str, object]) -> None:
     print(json.dumps(redacted, indent=2), file=sys.stderr)
 
 
-def _result(body: dict[str, object]) -> dict[str, object]:
+def job_output(body: dict[str, object]) -> dict[str, object]:
     """Return the worker output, or exit describing what went wrong."""
     output = body.get("output")
     if body.get("status") != "COMPLETED" or not isinstance(output, dict):
@@ -175,7 +218,7 @@ def run_clone(args: argparse.Namespace, api_key: str) -> int:
     )
     wall_seconds = time.perf_counter() - started
     summarize(body)
-    output = _result(body)
+    output = job_output(body)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(base64.b64decode(output["audio_b64"]))
@@ -217,7 +260,7 @@ def run_register(args: argparse.Namespace, api_key: str) -> int:
         use_async=args.use_async,
     )
     summarize(body)
-    voice = _result(body)["voice"]
+    voice = job_output(body)["voice"]
     print(f"registered voice {voice['name']}")
     print(f"  duration : {voice.get('duration_seconds')} s")
     print(f"  sha256   : {voice.get('sha256')}")
@@ -232,7 +275,7 @@ def run_list(args: argparse.Namespace, api_key: str) -> int:
         timeout=args.timeout,
         use_async=args.use_async,
     )
-    voices = _result(body)["voices"]
+    voices = job_output(body)["voices"]
     if not voices:
         print("no voices registered")
         return 0
@@ -252,7 +295,7 @@ def run_delete(args: argparse.Namespace, api_key: str) -> int:
         timeout=args.timeout,
         use_async=args.use_async,
     )
-    _result(body)
+    job_output(body)
     print(f"deleted voice {args.name}")
     return 0
 
