@@ -91,7 +91,8 @@ Created against `https://rest.runpod.io/v1` with the account's `RUNPOD_API_KEY`.
 | Endpoint name | `breeze-tts-clone` |
 | Template id | `lbawlul4gz` |
 | Image | `ghcr.io/bobmatnyc/breeze-tts-serverless:latest` |
-| Image digest | `sha256:7afcf1bda51e5e82721a8c9b1f2f02f39b366f6c991190c3ae7640f9d9e5825b` |
+| Image digest at live test | `sha256:7afcf1bda51e5e82721a8c9b1f2f02f39b366f6c991190c3ae7640f9d9e5825b` |
+| Immutable tag for that build | `…-serverless:66c4b2221e276aa2c6a5489a9390b0ffccc18500` |
 | Network volume | `breeze-tts-2-weights`, id `wcc9h8jf77`, 10 GB, `EU-RO-1` |
 | GPU pool | `NVIDIA GeForce RTX 4090`, then `NVIDIA RTX A5000`, `NVIDIA L4` |
 | Compute type | GPU, 1 per worker |
@@ -101,6 +102,10 @@ Created against `https://rest.runpod.io/v1` with the account's `RUNPOD_API_KEY`.
 | Idle timeout | 30 s |
 | Execution timeout | 900000 ms |
 | Container disk | 30 GB |
+
+The template points at `:latest`, which every build moves, so a worker started
+after a later build runs that build instead. Point the template at the commit
+tag to pin a specific image; the digest above is the one the live test ran.
 
 Min workers is 0, so the endpoint bills nothing while idle. The network volume
 is billed continuously at roughly $0.07/GB/month — about **$0.70/month** for
