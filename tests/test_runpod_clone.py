@@ -192,6 +192,97 @@ def test_subcommands_are_registered(tmp_path) -> None:
     assert register.func is runpod_clone.run_register
 
 
+# --- job submission -------------------------------------------------------
+
+
+class StubResponse:
+    def __init__(self, body: dict) -> None:
+        self._body = body
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return self._body
+
+
+class StubTransport:
+    """Stands in for `requests`, answering from a scripted list of bodies."""
+
+    def __init__(self, post_body: dict, get_bodies: list[dict]) -> None:
+        self.post_body = post_body
+        self.get_bodies = list(get_bodies)
+        self.posted: list[str] = []
+        self.fetched: list[str] = []
+
+    def post(self, url, **kwargs) -> StubResponse:
+        self.posted.append(url)
+        return StubResponse(self.post_body)
+
+    def get(self, url, **kwargs) -> StubResponse:
+        self.fetched.append(url)
+        return StubResponse(self.get_bodies.pop(0))
+
+
+def test_submit_returns_terminal_runsync_body(monkeypatch) -> None:
+    transport = StubTransport({"status": "COMPLETED", "output": {}}, [])
+    monkeypatch.setattr(runpod_clone, "requests", transport)
+
+    body = runpod_clone.submit("e1", "k", {}, timeout=30, use_async=False)
+
+    assert body["status"] == "COMPLETED"
+    assert transport.fetched == []
+    assert transport.posted == ["https://api.runpod.ai/v2/e1/runsync"]
+
+
+def test_submit_polls_when_runsync_returns_in_queue(monkeypatch) -> None:
+    transport = StubTransport(
+        {"status": "IN_QUEUE", "id": "job-7"},
+        [
+            {"status": "IN_PROGRESS", "id": "job-7"},
+            {"status": "COMPLETED", "id": "job-7", "output": {"ok": True}},
+        ],
+    )
+    monkeypatch.setattr(runpod_clone, "requests", transport)
+    monkeypatch.setattr(runpod_clone.time, "sleep", lambda seconds: None)
+
+    body = runpod_clone.submit(
+        "e1", "k", {}, timeout=30, use_async=False, poll_seconds=0
+    )
+
+    assert body["status"] == "COMPLETED"
+    assert transport.fetched == ["https://api.runpod.ai/v2/e1/status/job-7"] * 2
+
+
+def test_submit_returns_a_non_terminal_body_that_carries_no_job_id(
+    monkeypatch,
+) -> None:
+    transport = StubTransport({"status": "IN_QUEUE"}, [])
+    monkeypatch.setattr(runpod_clone, "requests", transport)
+
+    body = runpod_clone.submit("e1", "k", {}, timeout=30, use_async=False)
+
+    assert body == {"status": "IN_QUEUE"}
+    assert transport.fetched == []
+
+
+def test_poll_status_returns_terminal_body(monkeypatch) -> None:
+    transport = StubTransport({}, [{"status": "FAILED", "error": "boom"}])
+    monkeypatch.setattr(runpod_clone, "requests", transport)
+
+    body = runpod_clone.poll_status("e1", "k", "job-9", timeout=30, poll_seconds=0)
+
+    assert body["status"] == "FAILED"
+
+
+def test_poll_status_gives_up_at_the_deadline(monkeypatch) -> None:
+    transport = StubTransport({}, [{"status": "IN_QUEUE"}])
+    monkeypatch.setattr(runpod_clone, "requests", transport)
+
+    with pytest.raises(SystemExit, match="did not finish within 0s"):
+        runpod_clone.poll_status("e1", "k", "job-9", timeout=0, poll_seconds=0)
+
+
 def test_summarize_elides_audio_body(capsys) -> None:
     runpod_clone.summarize(
         {
