@@ -1,0 +1,28 @@
+# OpenAI-compatible speech shim. Separate from docker/Dockerfile on purpose:
+# this image needs no CUDA, no torch and no model, so it is a few tens of MB
+# rather than several GB and can run next to whatever tool is calling it.
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    SHIM_HOST=0.0.0.0 \
+    SHIM_PORT=8080
+
+# ffmpeg transcodes the worker's WAV to MP3, which is OpenAI's default format.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/breeze-shim
+
+COPY docker/requirements-shim.txt ./
+RUN python -m pip install --upgrade pip \
+    && python -m pip install -r requirements-shim.txt
+
+COPY scripts/openai_shim.py ./scripts/openai_shim.py
+
+EXPOSE 8080
+
+# SHIM_API_KEY, RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID are supplied at run time.
+CMD ["python", "-u", "scripts/openai_shim.py"]

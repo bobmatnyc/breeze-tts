@@ -1,0 +1,88 @@
+name: serverless-image
+
+# Builds the RunPod Serverless worker image and pushes it to GHCR. The
+# repository is public, so RunPod pulls the image without registry credentials.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/runpod-serverless
+    # A rebuild takes five minutes and moves the :latest tag, so documentation
+    # alone should not trigger one. Use workflow_dispatch to force a build.
+    paths-ignore:
+      - "**/*.md"
+      - LICENSE
+      - assets/**
+
+concurrency:
+  group: serverless-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/breeze-tts-serverless
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # The CUDA base plus the torch wheels overflow the ~14 GB the runner
+      # leaves free by default. Dropping the preinstalled toolchains recovers
+      # roughly 25 GB before the build starts.
+      - name: Free runner disk space
+        run: |
+          set -euxo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/.ghcup \
+                      /usr/share/swift /usr/local/share/powershell \
+                      "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            BASE_IMAGE=pytorch/pytorch:2.9.1-cuda12.8-cudnn9-runtime
+            BUILD_FLASH_ATTN=0
+            INSTALL_SERVERLESS_DEPS=1
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          # Links the GHCR package to this repository, so the package inherits
+          # the repository's access. RunPod pulls anonymously, so the package
+          # must end up public.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Report image reference
+        run: |
+          echo "image=${IMAGE}:${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
+          echo "digest=${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${IMAGE}@${DIGEST}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}

@@ -1,0 +1,8 @@
+# Extra dependencies for the RunPod Serverless image, installed when the build
+# passes INSTALL_SERVERLESS_DEPS=1. The pod/dev image does not need them.
+runpod==1.12.0
+
+# The worker downloads the checkpoint onto the network volume on first boot.
+# Held below 1.0 because transformers 4.57.3 requires huggingface-hub<1.0; the
+# 1.x line would resolve but break the pinned transformers install.
+huggingface-hub==0.36.2
