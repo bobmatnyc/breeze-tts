@@ -65,18 +65,42 @@ def encode_audio(path: Path) -> str:
     return base64.b64encode(audio).decode("ascii")
 
 
+def generation_fields(
+    args: argparse.Namespace, *, seed: int | None = None
+) -> dict[str, object]:
+    """The generation settings a clone job carries, dropping the ones unset.
+
+    Why: the reader builds its own payloads chunk by chunk with a per-chunk
+    seed, and the two builders drifting apart is how a lever ends up wired into
+    one client and not the other. An unset field is omitted rather than sent as
+    null, so the worker sees exactly the overrides that were asked for.
+
+    Test: `test_generation_fields_drops_what_is_unset`,
+    `test_generation_fields_takes_a_seed_override`
+    """
+    fields = {
+        "seed": args.seed if seed is None else seed,
+        "cfg_scale": args.cfg_scale,
+        "instruction": getattr(args, "instruction", None),
+        "temperature": getattr(args, "temperature", None),
+        "top_p": getattr(args, "top_p", None),
+        "top_k": getattr(args, "top_k", None),
+    }
+    return {name: value for name, value in fields.items() if value is not None}
+
+
 def build_clone_payload(args: argparse.Namespace) -> dict[str, object]:
     """Assemble a clone job, using exactly one voice source.
 
     Test: `test_build_clone_payload_uses_voice`,
     `test_build_clone_payload_uses_inline_reference`,
-    `test_build_clone_payload_rejects_both_sources`
+    `test_build_clone_payload_rejects_both_sources`,
+    `test_build_clone_payload_carries_voice_direction`
     """
     job: dict[str, object] = {
         "op": "clone",
         "text": args.text,
-        "seed": args.seed,
-        "cfg_scale": args.cfg_scale,
+        **generation_fields(args),
     }
     if args.voice and args.ref_audio:
         raise SystemExit("Pass either --voice or --ref-audio, not both.")
@@ -327,6 +351,21 @@ def build_parser() -> argparse.ArgumentParser:
     clone.add_argument("--ref-text", help="Exact transcript of --ref-audio.")
     clone.add_argument("--seed", type=int, default=42)
     clone.add_argument("--cfg-scale", type=float, default=1.0)
+    clone.add_argument(
+        "--instruction",
+        help="Voice Direction: a natural-language steer on tone, emotion, pace "
+        'and delivery, e.g. "Speak slowly with a restrained, serious tone." '
+        "Needs --cfg-scale above 1; the model card recommends 4.",
+    )
+    clone.add_argument(
+        "--temperature", type=float, help="Sampling temperature for this request only."
+    )
+    clone.add_argument(
+        "--top-p", type=float, help="Nucleus sampling mass for this request only."
+    )
+    clone.add_argument(
+        "--top-k", type=int, help="Top-k sampling cutoff for this request only."
+    )
     clone.set_defaults(func=run_clone)
 
     register = subparsers.add_parser("register", help="Store a named voice.")

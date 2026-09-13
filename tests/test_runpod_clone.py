@@ -294,3 +294,73 @@ def test_summarize_elides_audio_body(capsys) -> None:
     assert "120 base64 chars" in printed
     assert "A" * 120 not in printed
     assert '"sample_rate": 24000' in printed
+
+
+# --- Voice Direction and per-request sampling -----------------------------
+
+
+def test_build_clone_payload_carries_voice_direction(tmp_path) -> None:
+    args = parse(
+        "clone",
+        "--endpoint-id",
+        "e1",
+        "--text",
+        "hello",
+        "--output",
+        str(tmp_path / "o.wav"),
+        "--voice",
+        "bob",
+        "--instruction",
+        "Speak slowly with a restrained, serious tone.",
+        "--cfg-scale",
+        "4",
+        "--temperature",
+        "1.1",
+        "--top-k",
+        "80",
+    )
+
+    job = runpod_clone.build_clone_payload(args)["input"]
+
+    assert job == {
+        "op": "clone",
+        "text": "hello",
+        "seed": 42,
+        "cfg_scale": 4.0,
+        "instruction": "Speak slowly with a restrained, serious tone.",
+        "temperature": 1.1,
+        "top_k": 80,
+        "voice": "bob",
+    }
+
+
+def test_generation_fields_drops_what_is_unset(tmp_path) -> None:
+    args = parse(
+        "clone",
+        "--endpoint-id",
+        "e1",
+        "--text",
+        "hello",
+        "--output",
+        str(tmp_path / "o.wav"),
+        "--voice",
+        "bob",
+    )
+
+    assert runpod_clone.generation_fields(args) == {"seed": 42, "cfg_scale": 1.0}
+
+
+def test_generation_fields_takes_a_seed_override(tmp_path) -> None:
+    args = parse(
+        "clone",
+        "--endpoint-id",
+        "e1",
+        "--text",
+        "hello",
+        "--output",
+        str(tmp_path / "o.wav"),
+        "--voice",
+        "bob",
+    )
+
+    assert runpod_clone.generation_fields(args, seed=99)["seed"] == 99

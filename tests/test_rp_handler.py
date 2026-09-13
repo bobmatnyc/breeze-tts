@@ -151,7 +151,17 @@ def test_validate_job_input_strips_ref_text_whitespace(job_input) -> None:
         ({"cfg_scale": 0}, "greater than 0"),
         ({"cfg_scale": -1.0}, "greater than 0"),
         ({"cfg_scale": float("nan")}, "greater than 0"),
-        ({"cfg_scale": 2.0}, "must be 1.0 for voice cloning"),
+        ({"cfg_scale": 2.0}, "must be 1.0 without an 'instruction'"),
+        ({"instruction": ""}, "'instruction' must be a non-empty string"),
+        ({"instruction": 7}, "'instruction' must be a non-empty string"),
+        ({"instruction": "x" * 1001}, "'instruction' exceeds"),
+        ({"temperature": "hot"}, "'temperature' must be a number"),
+        ({"temperature": 0.0}, "'temperature' must be between"),
+        ({"temperature": 5.0}, "'temperature' must be between"),
+        ({"top_p": 1.5}, "'top_p' must be between"),
+        ({"top_p": True}, "'top_p' must be a number"),
+        ({"top_k": 0}, "'top_k' must be between"),
+        ({"top_k": "8"}, "'top_k' must be an integer"),
         ({"op": "sing"}, "'op' must be one of"),
     ],
 )
@@ -359,7 +369,9 @@ def stubbed_runtime(monkeypatch, tmp_path) -> _Runtime:
     templates_module.prepare_inputs = prepare_inputs
     templates_module.get_template = lambda name: f"template:{name}"
     templates_module.select_template_name = lambda request: (
-        "ref_clone_tata" if request.get("ref_audio_path") else "tts_plain"
+        ("ref_edit_tata" if request.get("instruction") else "ref_clone_tata")
+        if request.get("ref_audio_path")
+        else "tts_plain"
     )
 
     monkeypatch.setitem(sys.modules, "breeze_infer.runtime", runtime_module)
@@ -372,7 +384,11 @@ def stubbed_runtime(monkeypatch, tmp_path) -> _Runtime:
         "STATE",
         {
             "tokenizer": object(),
-            "model": object(),
+            "model": types.SimpleNamespace(
+                generation_config=types.SimpleNamespace(
+                    temperature=0.9, top_p=1.0, top_k=50
+                )
+            ),
             "audio_tokenizer": object(),
             "runtime": runtime,
             "load_seconds": 12.5,
@@ -505,3 +521,111 @@ def test_handler_reports_duplicate_registration(job_input, stubbed_runtime) -> N
 
     forced = rp_handler.handler({"id": "c", "input": dict(payload, overwrite=True)})
     assert forced["voice"]["name"] == "bob"
+
+
+# --- Voice Direction and per-request sampling -----------------------------
+
+
+def test_validate_job_input_accepts_guidance_with_an_instruction(job_input) -> None:
+    job_input.update({"instruction": "  Speak conversationally.  ", "cfg_scale": 4.0})
+
+    validated = rp_handler.validate_job_input(job_input)
+
+    assert validated["instruction"] == "Speak conversationally."
+    assert validated["cfg_scale"] == 4.0
+
+
+def test_validate_job_input_defaults_the_optional_generation_fields(
+    job_input,
+) -> None:
+    validated = rp_handler.validate_job_input(job_input)
+
+    assert validated["instruction"] is None
+    assert validated["temperature"] is None
+    assert validated["top_p"] is None
+    assert validated["top_k"] is None
+
+
+def test_validate_job_input_accepts_sampling_in_range(job_input) -> None:
+    job_input.update({"temperature": 1.1, "top_p": 0.9, "top_k": 80})
+
+    validated = rp_handler.validate_job_input(job_input)
+
+    assert (validated["temperature"], validated["top_p"], validated["top_k"]) == (
+        1.1,
+        0.9,
+        80,
+    )
+
+
+def test_handler_routes_an_instruction_to_the_direction_template(
+    job_input, stubbed_runtime
+) -> None:
+    job_input.update({"instruction": "Speak conversationally.", "cfg_scale": 4.0})
+
+    rp_handler.handler({"id": "job-i", "input": job_input})
+
+    seen = stubbed_runtime.seen
+    assert seen["template"] == "template:ref_edit_tata"
+    assert seen["request"]["instruction"] == "Speak conversationally."
+    assert seen["kwargs"]["guidance_scale"] == 4.0
+
+
+def test_handler_sends_no_instruction_field_without_one(
+    job_input, stubbed_runtime
+) -> None:
+    rp_handler.handler({"id": "job-n", "input": job_input})
+
+    assert "instruction" not in stubbed_runtime.seen["request"]
+
+
+def _watch_sampling(stubbed_runtime, monkeypatch) -> list[tuple]:
+    """Record the model's live sampling settings as each generation starts."""
+    config = rp_handler.STATE["model"].generation_config
+    seen: list[tuple] = []
+    original = stubbed_runtime.iter_audio_chunks
+
+    def spy(inputs, **kwargs):
+        seen.append((config.temperature, config.top_p, config.top_k))
+        return original(inputs, **kwargs)
+
+    monkeypatch.setattr(stubbed_runtime, "iter_audio_chunks", spy)
+    return seen
+
+
+def test_handler_applies_sampling_overrides_for_one_request(
+    job_input, stubbed_runtime, monkeypatch
+) -> None:
+    seen = _watch_sampling(stubbed_runtime, monkeypatch)
+    job_input.update({"temperature": 1.2, "top_p": 0.8, "top_k": 80})
+
+    result = rp_handler.handler({"id": "job-s", "input": job_input})
+
+    assert "error" not in result
+    assert seen == [(1.2, 0.8, 80)]
+
+
+def test_handler_restores_sampling_after_a_request(
+    job_input, stubbed_runtime, monkeypatch
+) -> None:
+    """An override on one job must not become this worker's new default."""
+    seen = _watch_sampling(stubbed_runtime, monkeypatch)
+
+    rp_handler.handler({"id": "job-1", "input": dict(job_input, temperature=1.5)})
+    rp_handler.handler({"id": "job-2", "input": job_input})
+
+    assert seen == [(1.5, 1.0, 50), (0.9, 1.0, 50)]
+    config = rp_handler.STATE["model"].generation_config
+    assert (config.temperature, config.top_p, config.top_k) == (0.9, 1.0, 50)
+
+
+def test_handler_leaves_the_model_untouched_without_overrides(
+    job_input, stubbed_runtime
+) -> None:
+    config = rp_handler.STATE["model"].generation_config
+    del config.temperature
+
+    result = rp_handler.handler({"id": "job-u", "input": job_input})
+
+    assert "error" not in result
+    assert not hasattr(config, "temperature")

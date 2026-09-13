@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import math
 import os
 import tempfile
@@ -53,6 +54,16 @@ DEFAULT_CFG_SCALE = 1.0
 # `/runsync` accepts 20 MB and `/run` 10 MB of JSON, and base64 inflates by 4/3.
 MAX_REF_AUDIO_BYTES = 6 * 1024 * 1024
 MAX_TEXT_CHARS = 5000
+MAX_INSTRUCTION_CHARS = 1000
+
+# Sampling settings a request may override for itself. They live on the shared
+# `model.generation_config`, which `FastBreezeStreamingRuntime._sampling_params`
+# re-reads on every call (`models/fast_streaming.py:211-222,771-772`), so an
+# override takes effect for one generation and is restored after it.
+SAMPLING_FIELDS = ("temperature", "top_p", "top_k")
+TEMPERATURE_RANGE = (0.05, 2.0)
+TOP_P_RANGE = (0.01, 1.0)
+TOP_K_RANGE = (1, 1000)
 
 OPERATIONS = ("clone", "register_voice", "list_voices", "delete_voice")
 
@@ -110,7 +121,61 @@ def _decode_reference_audio(job_input: dict[str, Any]) -> tuple[np.ndarray, int]
     return samples, sample_rate
 
 
-def _validate_scalars(job_input: dict[str, Any]) -> tuple[int, float]:
+def _optional_number(
+    job_input: dict[str, Any], field: str, bounds: tuple[float, float]
+) -> float | None:
+    """A finite in-range float, or None when the job did not send the field."""
+    value = job_input.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise InputError(f"'{field}' must be a number.")
+    value = float(value)
+    low, high = bounds
+    if not math.isfinite(value) or not low <= value <= high:
+        raise InputError(f"'{field}' must be between {low} and {high}.")
+    return value
+
+
+def _optional_top_k(job_input: dict[str, Any]) -> int | None:
+    """An in-range integer top-k, or None when the job did not send one."""
+    value = job_input.get("top_k")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InputError("'top_k' must be an integer.")
+    low, high = TOP_K_RANGE
+    if not low <= value <= high:
+        raise InputError(f"'top_k' must be between {low} and {high}.")
+    return value
+
+
+def _optional_instruction(job_input: dict[str, Any]) -> str | None:
+    """The Voice Direction steer, or None when the job did not send one."""
+    value = job_input.get("instruction")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise InputError("'instruction' must be a non-empty string when present.")
+    if len(value) > MAX_INSTRUCTION_CHARS:
+        raise InputError(f"'instruction' exceeds {MAX_INSTRUCTION_CHARS} characters.")
+    return value.strip()
+
+
+def _validate_generation(job_input: dict[str, Any]) -> dict[str, Any]:
+    """Normalize every generation setting a clone may carry.
+
+    Why: guidance needs a negative prompt to pull away from, and only the
+    instruction templates define one. `ref_clone_tata` — a reference with no
+    instruction — does not, so `prepare_inputs` rejects any `cfg_scale` but 1.0
+    for it (`breeze_infer/templates.py:342-346`). Sending an `instruction`
+    selects `ref_edit_tata`, which does define one, and guidance becomes
+    available: the check is therefore on the pair, not on `cfg_scale` alone.
+
+    Test: `test_validate_job_input_rejects_guidance_without_an_instruction`,
+    `test_validate_job_input_accepts_guidance_with_an_instruction`,
+    `test_validate_job_input_rejects_sampling_out_of_range`
+    """
     seed = job_input.get("seed", DEFAULT_SEED)
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise InputError("'seed' must be an integer.")
@@ -121,12 +186,22 @@ def _validate_scalars(job_input: dict[str, Any]) -> tuple[int, float]:
     cfg_scale = float(cfg_scale)
     if not math.isfinite(cfg_scale) or cfg_scale <= 0:
         raise InputError("'cfg_scale' must be greater than 0.")
-    if cfg_scale != 1.0:
+
+    instruction = _optional_instruction(job_input)
+    if cfg_scale != 1.0 and instruction is None:
         raise InputError(
-            "'cfg_scale' must be 1.0 for voice cloning: the ref_clone_tata "
-            "template defines no negative prompt, so guidance is unavailable."
+            "'cfg_scale' must be 1.0 without an 'instruction': the "
+            "ref_clone_tata template defines no negative prompt, so guidance is "
+            "unavailable. Send an 'instruction' to steer the read instead."
         )
-    return seed, cfg_scale
+    return {
+        "seed": seed,
+        "cfg_scale": cfg_scale,
+        "instruction": instruction,
+        "temperature": _optional_number(job_input, "temperature", TEMPERATURE_RANGE),
+        "top_p": _optional_number(job_input, "top_p", TOP_P_RANGE),
+        "top_k": _optional_top_k(job_input),
+    }
 
 
 def validate_job_input(job_input: Any) -> dict[str, Any]:
@@ -134,10 +209,10 @@ def validate_job_input(job_input: Any) -> dict[str, Any]:
 
     Preconditions: ``op`` is one of ``OPERATIONS`` (default ``clone``). A clone
     supplies exactly one voice source — a registered ``voice`` name, or an
-    inline ``ref_audio_b64`` plus ``ref_text`` pair. ``cfg_scale`` must be 1.0;
-    the ``ref_clone_tata`` template defines no negative prompt
-    (``breeze_infer/templates.py:120-124``), so ``prepare_inputs`` rejects any
-    other guidance scale (``breeze_infer/templates.py:342-346``).
+    inline ``ref_audio_b64`` plus ``ref_text`` pair. ``cfg_scale`` must be 1.0
+    unless the job also carries an ``instruction``; ``temperature``, ``top_p``
+    and ``top_k`` are optional per-request overrides, range-checked here and
+    restored after the generation that used them.
 
     Test: `test_validate_job_input_accepts_minimal_payload`,
     `test_validate_job_input_rejects_bad_fields`,
@@ -180,7 +255,7 @@ def validate_job_input(job_input: Any) -> dict[str, Any]:
         }
 
     text = _require_text(job_input, "text", limit=MAX_TEXT_CHARS)
-    seed, cfg_scale = _validate_scalars(job_input)
+    generation = _validate_generation(job_input)
 
     has_voice = "voice" in job_input and job_input["voice"] is not None
     has_inline = any(
@@ -196,12 +271,7 @@ def validate_job_input(job_input: Any) -> dict[str, Any]:
             "voice, or 'ref_audio_b64' with its 'ref_text'."
         )
 
-    request: dict[str, Any] = {
-        "op": op,
-        "text": text,
-        "seed": seed,
-        "cfg_scale": cfg_scale,
-    }
+    request: dict[str, Any] = {"op": op, "text": text, **generation}
     if has_voice:
         try:
             request["voice"] = validate_name(job_input["voice"])
@@ -362,6 +432,38 @@ def _reference_for(request: dict[str, Any], workdir: Path) -> tuple[Path, str]:
     return path, request["ref_text"]
 
 
+@contextlib.contextmanager
+def _sampling_overrides(model: Any, request: dict[str, Any]):
+    """Apply this request's sampling settings to the shared model, then restore.
+
+    Why: one worker process serves every job, and ``generation_config`` is
+    module-level mutable state read fresh on each generation. Setting it without
+    putting it back would leak chunk N's temperature into chunk N+1 — a
+    per-request knob that silently becomes a worker-wide one.
+
+    What: a no-op when the request overrides nothing, so a job that sends none
+    of the three never touches the loaded model at all.
+
+    Test: `test_handler_applies_sampling_overrides_for_one_request`,
+    `test_handler_restores_sampling_after_a_request`
+    """
+    overrides = {
+        name: request[name] for name in SAMPLING_FIELDS if request.get(name) is not None
+    }
+    if not overrides:
+        yield
+        return
+    config = model.generation_config
+    previous = {name: getattr(config, name, None) for name in overrides}
+    for name, value in overrides.items():
+        setattr(config, name, value)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            setattr(config, name, value)
+
+
 def _generate(request: dict[str, Any], request_id: str) -> dict[str, Any]:
     """Run one clone and return the response body.
 
@@ -392,6 +494,11 @@ def _generate(request: dict[str, Any], request_id: str) -> dict[str, Any]:
             "ref_audio_path": str(reference_path),
             "ref_text": ref_text,
         }
+        if request.get("instruction"):
+            # select_template_name reads this to pick ref_edit_tata, the
+            # reference-plus-instruction template that carries a negative prompt
+            # and therefore accepts a cfg_scale above 1.
+            job_request["instruction"] = request["instruction"]
         set_all_seeds(request["seed"])
         inputs = prepare_inputs(
             STATE["tokenizer"],
@@ -413,15 +520,16 @@ def _generate(request: dict[str, Any], request_id: str) -> dict[str, Any]:
 
         generation_started = time.perf_counter()
         set_all_seeds(request["seed"])
-        pieces = [
-            np.asarray(chunk.audio, dtype=np.float32).reshape(-1)
-            for chunk in runtime.iter_audio_chunks(
-                inputs,
-                request_id=request_id,
-                seed=request["seed"],
-                token_observer=count_step,
-            )
-        ]
+        with _sampling_overrides(STATE["model"], request):
+            pieces = [
+                np.asarray(chunk.audio, dtype=np.float32).reshape(-1)
+                for chunk in runtime.iter_audio_chunks(
+                    inputs,
+                    request_id=request_id,
+                    seed=request["seed"],
+                    token_observer=count_step,
+                )
+            ]
         generation_seconds = time.perf_counter() - generation_started
 
     audio = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
