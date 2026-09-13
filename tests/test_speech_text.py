@@ -258,12 +258,24 @@ Human speech does none of this. A speaker plans the next clause while still fini
 So the levers here are deliberately modest. A seed that moves per chunk, a gap drawn from a range rather than fixed, and a filler rate that starts at zero until somebody listens to both versions and decides. None of them retrains."""  # noqa: E501
 
 
+def filler_tally(text: str) -> dict[str, int]:
+    """Count each filler in the text, by the exact forms the module inserts."""
+    tally = {}
+    for filler in speech_text.FILLERS:
+        inserted = (
+            f" {filler}, "
+            if filler in speech_text.CLAUSE_ONLY
+            else f"{filler.capitalize()}, "
+        )
+        count = text.count(inserted)
+        if count:
+            tally[filler] = count
+    return tally
+
+
 def filler_count(text: str) -> int:
-    """Count the inserted fillers by the exact forms the module inserts."""
-    fillers = [f"{filler} " for filler, _ in speech_text.SENTENCE_FILLERS]
-    return sum(text.count(filler) for filler in fillers) + text.count(
-        f" {speech_text.CLAUSE_FILLER} "
-    )
+    """Every inserted filler, however spelled."""
+    return sum(filler_tally(text).values())
 
 
 def test_the_passage_is_three_hundred_words() -> None:
@@ -275,6 +287,29 @@ def test_inject_disfluencies_hits_the_requested_rate() -> None:
     spoken = speech_text.inject_disfluencies(PASSAGE, rate=3.6, seed=42)
 
     assert 10 <= filler_count(spoken) <= 12
+
+
+def test_inject_disfluencies_balances_the_mix() -> None:
+    """Five fillers, none of them dominating the passage."""
+    spoken = speech_text.inject_disfluencies(PASSAGE, rate=3.6, seed=42)
+
+    tally = filler_tally(spoken)
+    total = sum(tally.values())
+    assert set(tally) == set(speech_text.FILLERS), tally
+    assert max(tally.values()) <= 0.4 * total, tally
+
+
+def test_inject_disfluencies_never_repeats_a_filler_back_to_back() -> None:
+    spoken = speech_text.inject_disfluencies(PASSAGE, rate=8.0, seed=11)
+
+    placed = [
+        filler
+        for sentence in _sentences(spoken)
+        for filler in speech_text.FILLERS
+        if filler_tally(sentence + " ").get(filler)
+    ]
+    assert len(placed) > 5
+    assert all(first != second for first, second in zip(placed, placed[1:]))
 
 
 def test_inject_disfluencies_is_byte_identical_for_a_seed() -> None:
@@ -296,20 +331,28 @@ def test_inject_disfluencies_is_a_no_op_at_rate_zero() -> None:
     assert speech_text.inject_disfluencies(PASSAGE, rate=0.0, seed=42) == PASSAGE
 
 
+def _sentences(text: str) -> list[str]:
+    """Every sentence of a passage, in document order."""
+    return [
+        sentence
+        for paragraph in text.split("\n\n")
+        for sentence in speech_text.split_sentences(paragraph)
+    ]
+
+
 def test_inject_disfluencies_never_doubles_in_one_sentence() -> None:
     spoken = speech_text.inject_disfluencies(PASSAGE, rate=8.0, seed=7)
 
-    for paragraph in spoken.split("\n\n"):
-        for sentence in speech_text.split_sentences(paragraph):
-            assert filler_count(sentence + " ") <= 1, sentence
+    for sentence in _sentences(spoken):
+        assert filler_count(sentence + " ") <= 1, sentence
 
 
 def test_inject_disfluencies_keeps_every_original_word() -> None:
     """Injection adds words. It never drops, reorders or reflows them."""
     spoken = speech_text.inject_disfluencies(PASSAGE, rate=3.6, seed=42)
 
-    added = {filler for filler, _ in speech_text.SENTENCE_FILLERS}
-    added.add(speech_text.CLAUSE_FILLER)
+    added = {f"{filler.capitalize()}," for filler in speech_text.FILLERS}
+    added.update(f"{filler}," for filler in speech_text.FILLERS)
     kept = [
         word
         for word in spoken.split()

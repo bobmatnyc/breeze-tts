@@ -387,9 +387,14 @@ def split_sentences(paragraph: str) -> list[str]:
 # is highest. Clark and Fox Tree separate the two fillers: "um" marks a strong
 # boundary and a longer delay, "uh" a weaker clause-internal one. Sources in
 # articles/hyperdev/research/tts-naturalness-techniques.md, section 3.
-SENTENCE_FILLERS = (("Um,", 0.70), ("So,", 0.15), ("You know,", 0.15))
-CLAUSE_FILLER = "uh,"
-SENTENCE_START_SHARE = 0.75
+FILLERS = ("um", "uh", "so", "well", "you know")
+# "uh" is the one filler that needs a clause boundary to sit at: Clark and Fox
+# Tree put it at weak utterance-internal breaks, where the others mark the
+# strong boundary at a sentence start.
+CLAUSE_ONLY = frozenset({"uh"})
+# "Well," is the one that most naturally opens a sentence after a paragraph
+# break, so it wins a tie there.
+PARAGRAPH_FILLER = "well"
 
 # A filler needs a sentence long enough to have a planning load worth marking.
 MIN_FILLER_SENTENCE_WORDS = 6
@@ -446,14 +451,44 @@ def _clause_offsets(sentence: str) -> list[int]:
     return offsets
 
 
-def _weighted_filler(draw: float) -> str:
-    """Pick a sentence-initial filler from the weighted pool."""
-    running = 0.0
-    for filler, weight in SENTENCE_FILLERS:
-        running += weight
-        if draw < running:
-            return filler
-    return SENTENCE_FILLERS[-1][0]
+def _next_filler(
+    stream: random.Random,
+    used: dict[str, int],
+    previous: str | None,
+    *,
+    has_clause: bool,
+    opens_paragraph: bool,
+) -> str:
+    """Pick the next filler: least-used first, never the one just used.
+
+    Why: a weighted draw over five fillers skews badly at the ten or so
+    placements a single article gets — one listening pass had five of eight
+    come out "so". Rotating on the running count keeps the mix even at that
+    sample size, where a probability would not.
+
+    What: the pool drops the filler used at the previous placement, and drops a
+    clause-only filler in a sentence with no clause boundary to put it at.
+    Among the rest the lowest running count wins, "well" taking a tie in a
+    sentence that opens a paragraph, and the seeded shuffle breaks the rest.
+
+    Test: `test_inject_disfluencies_balances_the_mix`,
+    `test_inject_disfluencies_never_repeats_a_filler_back_to_back`
+    """
+    pool = [
+        filler
+        for filler in FILLERS
+        if filler != previous and (has_clause or filler not in CLAUSE_ONLY)
+    ]
+    if not pool:
+        pool = [filler for filler in FILLERS if has_clause or filler not in CLAUSE_ONLY]
+    stream.shuffle(pool)
+    return min(
+        pool,
+        key=lambda filler: (
+            used.get(filler, 0),
+            0 if opens_paragraph and filler == PARAGRAPH_FILLER else 1,
+        ),
+    )
 
 
 def _open_sentence_with(sentence: str, filler: str) -> str:
@@ -481,13 +516,17 @@ def inject_disfluencies(
     What: `rate` is fillers per 100 words. Placement is seeded and deterministic,
     so the same text, rate and seed produce byte-identical output and therefore
     the same chunk shas and the same cached audio. One filler per sentence at
-    most. "Um" and its "so," / "you know," variants open a sentence; "uh" sits
-    at a clause boundary inside one. Sentences that quote, parenthesise, carry a
-    URL or a code span, or hold one of the `protected` respellings are skipped
-    whole, as are headings, which reach this stage as paragraphs with no
-    terminal punctuation. A rate of 0 returns the text unchanged.
+    most, and never the same filler twice in a row. "Um," "so," "well" and "you
+    know" open a sentence, "well" preferred where one opens a paragraph; "uh"
+    sits at a clause boundary inside a sentence. Sentences that quote,
+    parenthesise, carry a URL or a code span, or hold one of the `protected`
+    respellings are skipped whole, as are headings, which reach this stage as
+    paragraphs with no terminal punctuation. A rate of 0 returns the text
+    unchanged.
 
     Test: `test_inject_disfluencies_hits_the_requested_rate`,
+    `test_inject_disfluencies_balances_the_mix`,
+    `test_inject_disfluencies_never_repeats_a_filler_back_to_back`,
     `test_inject_disfluencies_is_byte_identical_for_a_seed`,
     `test_inject_disfluencies_is_a_no_op_at_rate_zero`,
     `test_inject_disfluencies_never_doubles_in_one_sentence`
@@ -516,18 +555,27 @@ def inject_disfluencies(
 
     stream = random.Random(f"disfluency:{seed}")
     chosen = sorted(stream.sample(range(len(candidates)), target))
+    used: dict[str, int] = {}
+    previous: str | None = None
     for slot in chosen:
         position, order = candidates[slot]
         sentences = split[position]
         sentence = sentences[order]
         offsets = _clause_offsets(sentence)
-        if offsets and stream.random() >= SENTENCE_START_SHARE:
+        filler = _next_filler(
+            stream,
+            used,
+            previous,
+            has_clause=bool(offsets),
+            opens_paragraph=order == 0 and position > 0,
+        )
+        if filler in CLAUSE_ONLY:
             cut = offsets[stream.randrange(len(offsets))] + 1
-            sentences[order] = f"{sentence[:cut]} {CLAUSE_FILLER}{sentence[cut:]}"
+            sentences[order] = f"{sentence[:cut]} {filler},{sentence[cut:]}"
         else:
-            sentences[order] = _open_sentence_with(
-                sentence, _weighted_filler(stream.random())
-            )
+            sentences[order] = _open_sentence_with(sentence, f"{filler.capitalize()},")
+        used[filler] = used.get(filler, 0) + 1
+        previous = filler
 
     return "\n\n".join(
         piece if isinstance(piece, str) else " ".join(piece) for piece in split

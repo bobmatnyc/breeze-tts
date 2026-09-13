@@ -116,7 +116,9 @@ PART_DURATION_TOLERANCE_S = 0.05
 SEED_MODES = ("fixed", "vary")
 DEFAULT_SEED = 42
 DEFAULT_SEED_MODE = "vary"
-DEFAULT_DISFLUENCY_RATE = 0.0
+# Oviatt's measured rate for spontaneous monologue, and the variant Bob picked
+# out of the A/B listening pass (see docker/README.serverless.md, Naturalness).
+DEFAULT_DISFLUENCY_RATE = 3.6
 
 
 # --- Request parameters ----------------------------------------------------
@@ -591,8 +593,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_DISFLUENCY_RATE,
         metavar="PER_100_WORDS",
-        help="Filled pauses to insert per 100 words. 0 inserts none. "
-        "Spontaneous monologue measures about 3.6.",
+        help="Filled pauses to insert per 100 words, from um / uh / so / well / "
+        "you know. 0 inserts none; the default is the measured monologue rate.",
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(

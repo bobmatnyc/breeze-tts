@@ -859,6 +859,12 @@ TEN_CHUNKS = "\n\n".join(
 
 
 def run_options(tmp_path: Path, **overrides) -> argparse.Namespace:
+    """A reader command line over ten short chunks, with the gaps under test.
+
+    Disfluencies are off here: they add words, which would move the chunk
+    boundaries these gap assertions count.
+    """
+    overrides.setdefault("disfluency_rate", 0)
     chosen = read_options(tmp_path, TEN_CHUNKS + "\n", word_budget=5, **overrides)
     chosen.work_dir = tmp_path / "work"
     return chosen
@@ -961,14 +967,22 @@ def test_the_gap_flags_have_a_second_spelling(tmp_path: Path) -> None:
 # --- Disfluencies through the reader --------------------------------------
 
 
-def test_speech_for_injects_no_disfluencies_by_default(tmp_path: Path) -> None:
-    chosen = read_options(tmp_path, "The client joins the chunks with silence.\n")
+def test_the_disfluency_rate_defaults_to_the_monologue_measurement(
+    tmp_path: Path,
+) -> None:
+    chosen = read_options(tmp_path, "Text.\n")
 
-    assert chosen.disfluency_rate == 0.0
-    assert (
-        runpod_read.speech_for(chosen, {})
-        == "The client joins the chunks with silence."
+    assert chosen.disfluency_rate == 3.6
+
+
+def test_speech_for_injects_nothing_at_rate_zero(tmp_path: Path) -> None:
+    document = " ".join(
+        f"The client joins the finished chunks with a short silence number {word}."
+        for word in ("one", "two", "three", "four", "five")
     )
+    chosen = read_options(tmp_path, document + "\n", disfluency_rate=0)
+
+    assert runpod_read.speech_for(chosen, {}) == document
 
 
 def test_speech_for_injects_disfluencies_at_the_requested_rate(

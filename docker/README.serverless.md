@@ -419,7 +419,7 @@ be switched off on its own.
 | `--gap-sentence-ms` (alias of `--sentence-gap-ms`) | 600 | Mean silence after a chunk that does not end a paragraph |
 | `--gap-paragraph-ms` (alias of `--paragraph-gap-ms`) | 1200 | Mean silence after a chunk that ends a paragraph |
 | `--gap-jitter FRACTION` | 0.25 | Spread of each gap around its mean. `0` gives every join exactly the mean, as before |
-| `--disfluency-rate PER_100_WORDS` | 0 | Filled pauses inserted into the text before chunking. Off by default |
+| `--disfluency-rate PER_100_WORDS` | 3.6 | Filled pauses inserted into the text before chunking. `0` inserts none |
 | `--instruction TEXT` | none | Voice Direction, per the table above. Pair it with `--cfg-scale 4` |
 | `--temperature` / `--top-p` / `--top-k` | worker defaults | Per-request sampling overrides |
 
@@ -434,14 +434,26 @@ reproduces the spread. Spontaneous monologue carries about 3.6 disfluencies per
 `articles/hyperdev/research/tts-naturalness-techniques.md` in the Writing
 repository, and `.trusty-mpm/research/naturalness-levers-codebase.md` here.
 
-Disfluency injection is off by default because it is the one lever that changes
-the words. At `--disfluency-rate 3.6` it adds about eleven fillers to a
-300-word passage: "Um," / "So," / "You know," opening a sentence, "uh," inside
-a clause, never two in one sentence. It skips headings, quotations,
-parentheses, code spans, URLs and any pronunciation respelling, and the
+Disfluency injection is the one lever that changes the words, so it is also the
+one that was A/B'd before being switched on. The default rate of 3.6 per 100
+words is Oviatt's measured figure for spontaneous monologue, and the variant
+that came out most realistic in listening; `--disfluency-rate 0` inserts none.
+
+The inventory is five fillers — **um, uh, so, well, you know**. "Um," "So,"
+"Well," and "You know," open a sentence, "Well," preferred where the sentence
+opens a paragraph; "uh," sits at a clause boundary inside a sentence. The draw
+rotates on a running count rather than on a weight, because a weighted draw
+skews badly at the ten or so placements one article gets — an early pass came
+out five "so" in eight — and the same filler is never used twice in a row. On a
+300-word passage at 3.6 that is eleven fillers, no one of them more than about
+a quarter of the total.
+
+Injection never touches a heading, quotation, parenthesis, code span, URL or
+pronunciation respelling, and never puts two fillers in one sentence. The
 injected words go into the chunk text and therefore into the manifest, so what
 the model was asked to say is inspectable. Placement is seeded by `--seed`, so
-the same text and rate give byte-identical output every run.
+the same text, rate and seed give byte-identical output every run — and a rate
+change moves the text, which re-synthesises the reading like any other edit.
 
 Reproducibility and cost are unaffected. Every draw is a pure function of
 `--seed` and the chunk's position, so a re-run derives the same seeds and the
@@ -453,19 +465,20 @@ re-buying it, pass `--seed-mode fixed`. Changing only the gap flags is free —
 gaps are a joining decision, and no audio is re-requested for them.
 
 ```bash
-# The shipped defaults: varied seeds, jittered gaps, no fillers.
+# The shipped defaults: varied seeds, jittered gaps, fillers at 3.6/100 words.
 python scripts/runpod_read.py --endpoint-id <id> --voice bob \
   --input path/to/final.md --output outputs/article.wav --mp3
 
 # The old behaviour, exactly.
 python scripts/runpod_read.py --endpoint-id <id> --voice bob \
   --input path/to/final.md --output outputs/article.wav \
-  --seed-mode fixed --gap-jitter 0 --gap-sentence-ms 350 --gap-paragraph-ms 700
+  --seed-mode fixed --gap-jitter 0 --gap-sentence-ms 350 --gap-paragraph-ms 700 \
+  --disfluency-rate 0
 
-# An A/B of the text-level lever, into its own work directory.
+# The same reading with no fillers, into its own work directory, to A/B.
 python scripts/runpod_read.py --endpoint-id <id> --voice bob \
-  --input path/to/final.md --output outputs/article_fillers.wav \
-  --work-dir outputs/reads/article_fillers --disfluency-rate 3.6
+  --input path/to/final.md --output outputs/article_plain.wav \
+  --work-dir outputs/reads/article_plain --disfluency-rate 0
 
 # Voice Direction, which needs guidance above 1 to take hold.
 python scripts/runpod_read.py --endpoint-id <id> --voice bob \
@@ -475,7 +488,7 @@ python scripts/runpod_read.py --endpoint-id <id> --voice bob \
 ```
 
 The two readings on record below predate these defaults; they were produced
-with `--seed-mode fixed`, `--gap-jitter 0` and the 350/700 gaps.
+with `--seed-mode fixed`, `--gap-jitter 0`, the 350/700 gaps and no fillers.
 
 ### Two readings on record
 
