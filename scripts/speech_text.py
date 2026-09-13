@@ -21,12 +21,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 from pathlib import Path
 
 AUTHOR_FOOTER_PREFIX = "Bob Matsuoka is CTO"
 
 DEFAULT_PRONUNCIATIONS = Path(__file__).resolve().parent / "pronunciations.json"
+
+_ABBREVIATIONS = frozenset(
+    """mr. mrs. ms. dr. prof. sr. jr. st. inc. ltd. co. corp. vs. etc. e.g. i.e.
+    cf. approx. fig. no. dept. est. al. a.m. p.m. u.s. u.k.""".split()
+)
 
 
 # --- Markdown to speakable text -------------------------------------------
@@ -338,3 +344,239 @@ def apply_pronunciations(text: str, lexicon: dict[str, str]) -> str:
         return _match_case(written, matched, spoken)
 
     return pattern.sub(replace, text)
+
+
+# --- Sentence splitting ----------------------------------------------------
+
+
+def _is_abbreviation(before: str) -> bool:
+    token = re.search(r"[\w.]+$", before)
+    if not token:
+        return False
+    word = token.group(0).casefold()
+    return word in _ABBREVIATIONS or bool(re.fullmatch(r"[a-z]\.", word))
+
+
+def split_sentences(paragraph: str) -> list[str]:
+    """Split one paragraph into sentences, holding common abbreviations back.
+
+    Test: `test_split_sentences_finds_boundaries`,
+    `test_split_sentences_keeps_abbreviations_together`
+    """
+    sentences: list[str] = []
+    start = 0
+    for match in re.finditer(r"""[.!?]+["')\]]*\s+""", paragraph):
+        following = paragraph[match.end() : match.end() + 1]
+        if following and not re.match(r"""[A-Z0-9"'(\[]""", following):
+            continue
+        if _is_abbreviation(paragraph[start : match.start() + 1]):
+            continue
+        sentences.append(paragraph[start : match.end()].strip())
+        start = match.end()
+    tail = paragraph[start:].strip()
+    if tail:
+        sentences.append(tail)
+    return sentences
+
+
+# --- Disfluency injection --------------------------------------------------
+
+# Oviatt (1995), reported in Bortfeld et al. 2001, measured about 3.6
+# disfluencies per 100 words in monologue against 5.5-8.8 in dialogue, and
+# Boomer/Shriberg put them at sentence and turn beginnings where planning load
+# is highest. Clark and Fox Tree separate the two fillers: "um" marks a strong
+# boundary and a longer delay, "uh" a weaker clause-internal one. Sources in
+# articles/hyperdev/research/tts-naturalness-techniques.md, section 3.
+FILLERS = ("um", "uh", "so", "well", "you know")
+# "uh" is the one filler that needs a clause boundary to sit at: Clark and Fox
+# Tree put it at weak utterance-internal breaks, where the others mark the
+# strong boundary at a sentence start.
+CLAUSE_ONLY = frozenset({"uh"})
+# "Well," is the one that most naturally opens a sentence after a paragraph
+# break, so it wins a tie there.
+PARAGRAPH_FILLER = "well"
+
+# A filler needs a sentence long enough to have a planning load worth marking.
+MIN_FILLER_SENTENCE_WORDS = 6
+# A clause filler needs real words on both sides of the boundary it follows.
+MIN_CLAUSE_SIDE_WORDS = 3
+
+# Any sentence carrying one of these is left alone outright rather than
+# reasoned about span by span: a quotation is someone else's words, a
+# parenthetical may be a vocal-event tag the model renders, a backtick is a
+# code span that escaped the Markdown pass, and a URL is not read as prose.
+_UNSAFE_CHARACTERS = "()[]{}\"'`“”‘’"
+_URL_MARKERS = ("://", "www.", "@")
+# Lowercased when a filler takes over the capital slot. Only closed-class
+# openers, so a sentence starting on a proper noun keeps its capital.
+_LOWERABLE_OPENERS = frozenset(
+    """a all an and any as at because before both but by each either every for
+    from he her here his how if in it its many most much neither no none not
+    nothing on once one other our over she some something such that the their
+    them then there these they this those to two under we what when where while
+    why with you your""".split()
+)
+
+
+def _sentence_is_eligible(sentence: str, protected: tuple[str, ...]) -> bool:
+    """True when a filler can be inserted into this sentence without damage.
+
+    A sentence with no terminal punctuation is a heading or a fragment — the
+    Markdown pass flattens headings into bare paragraphs, so terminal
+    punctuation is what distinguishes prose from a title at this stage.
+
+    Test: `test_inject_disfluencies_skips_headings_and_quotes`
+    """
+    if not re.search(r"[.!?]['\")\]]*$", sentence):
+        return False
+    if len(sentence.split()) < MIN_FILLER_SENTENCE_WORDS:
+        return False
+    if any(character in sentence for character in _UNSAFE_CHARACTERS):
+        return False
+    if any(marker in sentence for marker in _URL_MARKERS):
+        return False
+    return not any(word and word in sentence for word in protected)
+
+
+def _clause_offsets(sentence: str) -> list[int]:
+    """Offsets of clause boundaries inside a sentence, with words either side."""
+    offsets: list[int] = []
+    for match in re.finditer(r"[,;:]\s", sentence):
+        cut = match.start()
+        if (
+            len(sentence[:cut].split()) >= MIN_CLAUSE_SIDE_WORDS
+            and len(sentence[cut + 1 :].split()) >= MIN_CLAUSE_SIDE_WORDS
+        ):
+            offsets.append(cut)
+    return offsets
+
+
+def _next_filler(
+    stream: random.Random,
+    used: dict[str, int],
+    previous: str | None,
+    *,
+    has_clause: bool,
+    opens_paragraph: bool,
+) -> str:
+    """Pick the next filler: least-used first, never the one just used.
+
+    Why: a weighted draw over five fillers skews badly at the ten or so
+    placements a single article gets — one listening pass had five of eight
+    come out "so". Rotating on the running count keeps the mix even at that
+    sample size, where a probability would not.
+
+    What: the pool drops the filler used at the previous placement, and drops a
+    clause-only filler in a sentence with no clause boundary to put it at.
+    Among the rest the lowest running count wins, "well" taking a tie in a
+    sentence that opens a paragraph, and the seeded shuffle breaks the rest.
+
+    Test: `test_inject_disfluencies_balances_the_mix`,
+    `test_inject_disfluencies_never_repeats_a_filler_back_to_back`
+    """
+    pool = [
+        filler
+        for filler in FILLERS
+        if filler != previous and (has_clause or filler not in CLAUSE_ONLY)
+    ]
+    if not pool:
+        pool = [filler for filler in FILLERS if has_clause or filler not in CLAUSE_ONLY]
+    stream.shuffle(pool)
+    return min(
+        pool,
+        key=lambda filler: (
+            used.get(filler, 0),
+            0 if opens_paragraph and filler == PARAGRAPH_FILLER else 1,
+        ),
+    )
+
+
+def _open_sentence_with(sentence: str, filler: str) -> str:
+    """Put `filler` in front, lowercasing the displaced opener when it is safe."""
+    head, separator, tail = sentence.partition(" ")
+    if head[:1].isupper() and head.casefold().strip(",.;:") in _LOWERABLE_OPENERS:
+        head = head[:1].lower() + head[1:]
+    return f"{filler} {head}{separator}{tail}"
+
+
+def inject_disfluencies(
+    text: str,
+    *,
+    rate: float,
+    seed: int,
+    protected: tuple[str, ...] = (),
+) -> str:
+    """Insert filled pauses into speakable text at the measured monologue rate.
+
+    Why: the reader's cadence is even because written prose is even. Spontaneous
+    monologue carries about 3.6 disfluencies per 100 words, clustered where
+    planning load is highest, and none of that reaches the model unless the text
+    carries it.
+
+    What: `rate` is fillers per 100 words. Placement is seeded and deterministic,
+    so the same text, rate and seed produce byte-identical output and therefore
+    the same chunk shas and the same cached audio. One filler per sentence at
+    most, and never the same filler twice in a row. "Um," "so," "well" and "you
+    know" open a sentence, "well" preferred where one opens a paragraph; "uh"
+    sits at a clause boundary inside a sentence. Sentences that quote,
+    parenthesise, carry a URL or a code span, or hold one of the `protected`
+    respellings are skipped whole, as are headings, which reach this stage as
+    paragraphs with no terminal punctuation. A rate of 0 returns the text
+    unchanged.
+
+    Test: `test_inject_disfluencies_hits_the_requested_rate`,
+    `test_inject_disfluencies_balances_the_mix`,
+    `test_inject_disfluencies_never_repeats_a_filler_back_to_back`,
+    `test_inject_disfluencies_is_byte_identical_for_a_seed`,
+    `test_inject_disfluencies_is_a_no_op_at_rate_zero`,
+    `test_inject_disfluencies_never_doubles_in_one_sentence`
+    """
+    if rate <= 0:
+        return text
+
+    paragraphs = text.split("\n\n")
+    split: list[list[str] | str] = []
+    candidates: list[tuple[int, int]] = []
+    for position, paragraph in enumerate(paragraphs):
+        sentences = split_sentences(paragraph)
+        # Rebuilding must be lossless, or injection would reflow prose it was
+        # only asked to add words to.
+        if not sentences or " ".join(sentences) != paragraph.strip():
+            split.append(paragraph)
+            continue
+        split.append(sentences)
+        for order, sentence in enumerate(sentences):
+            if _sentence_is_eligible(sentence, protected):
+                candidates.append((position, order))
+
+    target = min(int(round(rate * len(text.split()) / 100.0)), len(candidates))
+    if target <= 0:
+        return text
+
+    stream = random.Random(f"disfluency:{seed}")
+    chosen = sorted(stream.sample(range(len(candidates)), target))
+    used: dict[str, int] = {}
+    previous: str | None = None
+    for slot in chosen:
+        position, order = candidates[slot]
+        sentences = split[position]
+        sentence = sentences[order]
+        offsets = _clause_offsets(sentence)
+        filler = _next_filler(
+            stream,
+            used,
+            previous,
+            has_clause=bool(offsets),
+            opens_paragraph=order == 0 and position > 0,
+        )
+        if filler in CLAUSE_ONLY:
+            cut = offsets[stream.randrange(len(offsets))] + 1
+            sentences[order] = f"{sentence[:cut]} {filler},{sentence[cut:]}"
+        else:
+            sentences[order] = _open_sentence_with(sentence, f"{filler.capitalize()},")
+        used[filler] = used.get(filler, 0) + 1
+        previous = filler
+
+    return "\n\n".join(
+        piece if isinstance(piece, str) else " ".join(piece) for piece in split
+    )

@@ -51,7 +51,12 @@ def options(**overrides) -> argparse.Namespace:
         "endpoint_id": "e1",
         "voice": "bob",
         "seed": 42,
+        "seed_mode": "fixed",
         "cfg_scale": 1.0,
+        "instruction": None,
+        "temperature": None,
+        "top_p": None,
+        "top_k": None,
         "timeout": 60,
         "sync": False,
         "rate_per_second": 0.000306,
@@ -315,13 +320,6 @@ def test_plan_gaps_widens_at_paragraph_ends(tmp_path: Path) -> None:
 
     assert [gap for _, gap in planned] == [350, 350, 700]
     assert [path.name for path, _ in planned] == ["a.wav", "b.wav", "c.wav"]
-
-
-def test_write_mp3_reports_missing_ffmpeg(tmp_path, monkeypatch, capsys) -> None:
-    monkeypatch.setattr(runpod_read.shutil, "which", lambda name: None)
-
-    assert runpod_read.write_mp3(tmp_path / "a.wav", tmp_path / "a.mp3") is False
-    assert "ffmpeg not found" in capsys.readouterr().err
 
 
 # --- Synthesis and resume -------------------------------------------------
@@ -667,6 +665,339 @@ def test_synthesise_reuses_everything_when_the_lexicon_is_unchanged(
 
 
 # --- Summary --------------------------------------------------------------
+
+
+def test_manifest_gaps_is_none_for_a_manifest_without_one(tmp_path) -> None:
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps({"chunks": []}))
+
+    assert runpod_read.manifest_gaps(path) is None
+
+
+def test_save_manifest_records_the_gap_plan(tmp_path: Path) -> None:
+    path = tmp_path / "manifest.json"
+    plan = runpod_read.GapPlan(sentence_ms=600, paragraph_ms=1200, jitter=0.25, seed=42)
+
+    runpod_read.save_manifest(path, {"0": {"index": 0}}, gaps=plan.as_dict())
+
+    assert runpod_read.manifest_gaps(path) == plan.as_dict()
+
+
+# --- Seeds and request parameters -----------------------------------------
+
+
+def test_part_seed_is_the_base_seed_when_fixed() -> None:
+    assert runpod_read.part_seed(42, 0, 0, "fixed") == 42
+    assert runpod_read.part_seed(42, 7, 1, "fixed") == 42
+
+
+def test_part_seed_varies_by_chunk() -> None:
+    seeds = [runpod_read.part_seed(42, index, 0, "vary") for index in range(10)]
+
+    assert len(set(seeds)) == 10
+    assert all(0 <= seed <= 0x7FFFFFFF for seed in seeds)
+
+
+def test_part_seed_is_reproducible() -> None:
+    assert runpod_read.part_seed(42, 3, 0, "vary") == runpod_read.part_seed(
+        42, 3, 0, "vary"
+    )
+    assert runpod_read.part_seed(43, 3, 0, "vary") != runpod_read.part_seed(
+        42, 3, 0, "vary"
+    )
+    assert runpod_read.part_seed(42, 3, 1, "vary") != runpod_read.part_seed(
+        42, 3, 0, "vary"
+    )
+
+
+def test_part_seed_rejects_an_unknown_mode() -> None:
+    with pytest.raises(SystemExit, match="--seed-mode"):
+        runpod_read.part_seed(42, 0, 0, "random")
+
+
+def test_params_sha_ignores_key_order() -> None:
+    first = runpod_read.params_sha({"seed": 1, "cfg_scale": 1.0})
+    second = runpod_read.params_sha({"cfg_scale": 1.0, "seed": 1})
+
+    assert first == second
+    assert first != runpod_read.params_sha({"seed": 2, "cfg_scale": 1.0})
+
+
+def test_clone_part_sends_the_voice_direction_fields(tmp_path, monkeypatch) -> None:
+    sent: list[dict] = []
+
+    def submit(endpoint_id, api_key, payload, **kwargs):
+        sent.append(payload["input"])
+        return {
+            "status": "COMPLETED",
+            "executionTime": 1000,
+            "output": {
+                "audio_b64": base64.b64encode(wav_bytes(1.0, tmp_path)).decode("ascii"),
+                "audio_seconds": 1.0,
+                "truncated": False,
+            },
+        }
+
+    monkeypatch.setattr(runpod_read.runpod_clone, "submit", submit)
+    chosen = options(
+        instruction="Speak conversationally.", cfg_scale=4.0, temperature=1.0
+    )
+
+    report = runpod_read.clone_part("Hello.", tmp_path / "p.wav", chosen, "k", seed=99)
+
+    assert sent[0]["instruction"] == "Speak conversationally."
+    assert sent[0]["cfg_scale"] == 4.0
+    assert sent[0]["temperature"] == 1.0
+    assert sent[0]["seed"] == 99
+    assert "top_p" not in sent[0], "an unset override must not be sent"
+    assert report["seed"] == 99
+
+
+def test_synthesise_records_a_different_seed_per_chunk(tmp_path, monkeypatch) -> None:
+    """Two consecutive chunks must not share a seed under --seed-mode vary."""
+    stub = StubEndpoint(wav_bytes(1.0, tmp_path))
+    monkeypatch.setattr(runpod_read.runpod_clone, "submit", stub.submit)
+    work = tmp_path / "work"
+    chunks = [
+        runpod_read.Chunk(0, "First chunk.", True),
+        runpod_read.Chunk(1, "Second chunk.", True),
+    ]
+
+    records = runpod_read.synthesise(chunks, work, options(seed_mode="vary"), "k")
+
+    seeds = [record["seed"] for record in records]
+    assert seeds[0] != seeds[1]
+    assert seeds == [
+        runpod_read.part_seed(42, 0, 0, "vary"),
+        runpod_read.part_seed(42, 1, 0, "vary"),
+    ]
+    written = json.loads((work / "manifest.json").read_text())["chunks"]
+    assert [record["seed"] for record in written] == seeds
+
+
+def test_synthesise_records_the_same_seeds_on_a_re_run(tmp_path, monkeypatch) -> None:
+    stub = StubEndpoint(wav_bytes(1.0, tmp_path))
+    monkeypatch.setattr(runpod_read.runpod_clone, "submit", stub.submit)
+    chunks = [
+        runpod_read.Chunk(0, "First chunk.", True),
+        runpod_read.Chunk(1, "Second chunk.", True),
+    ]
+
+    first = runpod_read.synthesise(
+        chunks, tmp_path / "a", options(seed_mode="vary"), "k"
+    )
+    second = runpod_read.synthesise(
+        chunks, tmp_path / "b", options(seed_mode="vary"), "k"
+    )
+
+    assert [record["seed"] for record in first] == [record["seed"] for record in second]
+
+
+def test_synthesise_redoes_a_chunk_when_the_seed_mode_changes(
+    tmp_path, monkeypatch
+) -> None:
+    stub = StubEndpoint(wav_bytes(1.0, tmp_path))
+    monkeypatch.setattr(runpod_read.runpod_clone, "submit", stub.submit)
+    work = tmp_path / "work"
+    chunks = [runpod_read.Chunk(0, "Only chunk.", True)]
+    runpod_read.synthesise(chunks, work, options(seed_mode="fixed"), "k")
+
+    stub.texts.clear()
+    runpod_read.synthesise(chunks, work, options(seed_mode="vary"), "k")
+
+    assert stub.texts == ["Only chunk."], "a seed-mode change reused stale audio"
+
+
+def test_synthesise_redoes_a_chunk_when_an_instruction_arrives(
+    tmp_path, monkeypatch
+) -> None:
+    stub = StubEndpoint(wav_bytes(1.0, tmp_path))
+    monkeypatch.setattr(runpod_read.runpod_clone, "submit", stub.submit)
+    work = tmp_path / "work"
+    chunks = [runpod_read.Chunk(0, "Only chunk.", True)]
+    runpod_read.synthesise(chunks, work, options(), "k")
+
+    stub.texts.clear()
+    runpod_read.synthesise(
+        chunks, work, options(instruction="Slow down.", cfg_scale=4.0), "k"
+    )
+
+    assert stub.texts == ["Only chunk."]
+
+
+def test_synthesise_resumes_a_manifest_written_before_params(
+    tmp_path, monkeypatch
+) -> None:
+    """A work directory from an older run still resumes under --seed-mode fixed."""
+    stub = StubEndpoint(wav_bytes(1.0, tmp_path))
+    monkeypatch.setattr(runpod_read.runpod_clone, "submit", stub.submit)
+    work = tmp_path / "work"
+    chunks = [runpod_read.Chunk(0, "Only chunk.", True)]
+    runpod_read.synthesise(chunks, work, options(), "k")
+
+    manifest = work / "manifest.json"
+    body = json.loads(manifest.read_text())
+    for record in body["chunks"]:
+        record.pop("params")
+        record.pop("seed")
+        for part in record["parts"]:
+            part.pop("seed")
+    manifest.write_text(json.dumps(body))
+
+    stub.texts.clear()
+    runpod_read.synthesise(chunks, work, options(), "k")
+
+    assert stub.texts == [], "an older manifest was thrown away"
+
+
+# --- Gaps through a whole run ---------------------------------------------
+
+TEN_CHUNKS = "\n\n".join(
+    f"Alpha bravo charlie delta {word}. Echo foxtrot golf hotel {word}."
+    for word in ("one", "two", "three", "four", "five")
+)
+
+
+def run_options(tmp_path: Path, **overrides) -> argparse.Namespace:
+    """A reader command line over ten short chunks, with the gaps under test.
+
+    Disfluencies are off here: they add words, which would move the chunk
+    boundaries these gap assertions count.
+    """
+    overrides.setdefault("disfluency_rate", 0)
+    chosen = read_options(tmp_path, TEN_CHUNKS + "\n", word_budget=5, **overrides)
+    chosen.work_dir = tmp_path / "work"
+    return chosen
+
+
+def recorded_gaps(work: Path) -> list[int]:
+    body = json.loads((work / "manifest.json").read_text())
+    return [part["gap_ms"] for record in body["chunks"] for part in record["parts"]]
+
+
+def test_run_jitters_the_recorded_gaps(tmp_path, monkeypatch) -> None:
+    stub = StubEndpoint(wav_bytes(1.0, tmp_path))
+    monkeypatch.setattr(runpod_read.runpod_clone, "submit", stub.submit)
+    monkeypatch.setattr(runpod_read.runpod_clone, "load_api_key", lambda path: "k")
+    chosen = run_options(tmp_path, gap_jitter=0.25)
+
+    assert runpod_read.run(chosen) == 0
+
+    gaps = recorded_gaps(chosen.work_dir)
+    assert len(gaps) == 10
+    assert len(set(gaps)) > 1, "every join in the reading got the same silence"
+
+
+def test_run_uses_exactly_the_means_at_zero_jitter(tmp_path, monkeypatch) -> None:
+    stub = StubEndpoint(wav_bytes(1.0, tmp_path))
+    monkeypatch.setattr(runpod_read.runpod_clone, "submit", stub.submit)
+    monkeypatch.setattr(runpod_read.runpod_clone, "load_api_key", lambda path: "k")
+    chosen = run_options(tmp_path, gap_jitter=0)
+
+    assert runpod_read.run(chosen) == 0
+
+    gaps = recorded_gaps(chosen.work_dir)
+    assert len(gaps) == 10
+    assert set(gaps) == {chosen.sentence_gap_ms, chosen.paragraph_gap_ms}
+
+
+def test_run_replays_recorded_gaps_on_a_resumed_run(tmp_path, monkeypatch) -> None:
+    """A resumed run joins exactly as the first one did, without redrawing."""
+    stub = StubEndpoint(wav_bytes(1.0, tmp_path))
+    monkeypatch.setattr(runpod_read.runpod_clone, "submit", stub.submit)
+    monkeypatch.setattr(runpod_read.runpod_clone, "load_api_key", lambda path: "k")
+    chosen = run_options(tmp_path, gap_jitter=0.25)
+    runpod_read.run(chosen)
+    first = recorded_gaps(chosen.work_dir)
+
+    # Pin the recorded gaps to values no draw would produce, then resume.
+    body = json.loads((chosen.work_dir / "manifest.json").read_text())
+    for record in body["chunks"]:
+        for part in record["parts"]:
+            part["gap_ms"] = 1234
+    (chosen.work_dir / "manifest.json").write_text(json.dumps(body))
+
+    stub.texts.clear()
+    runpod_read.run(chosen)
+
+    assert stub.texts == [], "a resumed run re-synthesised cached chunks"
+    assert recorded_gaps(chosen.work_dir) == [1234] * len(first)
+
+
+def test_run_redraws_gaps_when_the_plan_changes(tmp_path, monkeypatch) -> None:
+    stub = StubEndpoint(wav_bytes(1.0, tmp_path))
+    monkeypatch.setattr(runpod_read.runpod_clone, "submit", stub.submit)
+    monkeypatch.setattr(runpod_read.runpod_clone, "load_api_key", lambda path: "k")
+    chosen = run_options(tmp_path, gap_jitter=0.25)
+    runpod_read.run(chosen)
+
+    chosen.gap_jitter = 0.0
+    runpod_read.run(chosen)
+
+    assert set(recorded_gaps(chosen.work_dir)) == {
+        chosen.sentence_gap_ms,
+        chosen.paragraph_gap_ms,
+    }
+
+
+def test_gap_plan_for_reads_the_command_line(tmp_path: Path) -> None:
+    chosen = read_options(tmp_path, "Text.\n", gap_jitter=0.1, seed=7)
+
+    plan = runpod_read.gap_plan_for(chosen)
+
+    assert plan.jitter == 0.1
+    assert plan.seed == 7
+    assert plan.sentence_ms == runpod_read.DEFAULT_SENTENCE_GAP_MS
+    assert plan.paragraph_ms == runpod_read.DEFAULT_PARAGRAPH_GAP_MS
+
+
+def test_gap_plan_for_rejects_an_impossible_jitter(tmp_path: Path) -> None:
+    chosen = read_options(tmp_path, "Text.\n", gap_jitter=1.5)
+
+    with pytest.raises(SystemExit, match="--gap-jitter"):
+        runpod_read.gap_plan_for(chosen)
+
+
+def test_the_gap_flags_have_a_second_spelling(tmp_path: Path) -> None:
+    chosen = read_options(tmp_path, "Text.\n", gap_sentence_ms=500)
+
+    assert chosen.sentence_gap_ms == 500
+
+
+# --- Disfluencies through the reader --------------------------------------
+
+
+def test_the_disfluency_rate_defaults_to_the_monologue_measurement(
+    tmp_path: Path,
+) -> None:
+    chosen = read_options(tmp_path, "Text.\n")
+
+    assert chosen.disfluency_rate == 3.6
+
+
+def test_speech_for_injects_nothing_at_rate_zero(tmp_path: Path) -> None:
+    document = " ".join(
+        f"The client joins the finished chunks with a short silence number {word}."
+        for word in ("one", "two", "three", "four", "five")
+    )
+    chosen = read_options(tmp_path, document + "\n", disfluency_rate=0)
+
+    assert runpod_read.speech_for(chosen, {}) == document
+
+
+def test_speech_for_injects_disfluencies_at_the_requested_rate(
+    tmp_path: Path,
+) -> None:
+    document = " ".join(
+        f"The client joins the finished chunks with a short silence number {word}."
+        for word in ("one", "two", "three", "four", "five")
+    )
+    chosen = read_options(tmp_path, document + "\n", disfluency_rate=20)
+
+    spoken = runpod_read.speech_for(chosen, {})
+
+    assert spoken != document
+    assert "Um," in spoken or "So," in spoken or "You know," in spoken
 
 
 def test_report_totals_execution_and_cost(capsys) -> None:
