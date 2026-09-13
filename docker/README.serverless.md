@@ -310,6 +310,11 @@ python scripts/runpod_clone.py list   --endpoint-id <id>
 python scripts/runpod_clone.py delete --endpoint-id <id> --name bob
 python scripts/runpod_clone.py clone  --endpoint-id <id> \
   --voice bob --text "Hello" --output outputs/hello.wav
+
+# Voice Direction: steer the delivery, with guidance strong enough to hold.
+python scripts/runpod_clone.py clone  --endpoint-id <id> \
+  --voice bob --text "Hello" --output outputs/hello_slow.wav \
+  --instruction "Speak slowly with a restrained, serious tone." --cfg-scale 4
 ```
 
 The job `input` carries an `op`: `clone` (the default), `register_voice`,
@@ -317,6 +322,32 @@ The job `input` carries an `op`: `clone` (the default), `register_voice`,
 either `voice` or the `ref_audio_b64`/`ref_text` pair; supplying both or neither
 is an error. An unknown voice name fails closed with a message listing what is
 registered.
+
+A clone also takes these optional generation fields, all validated before the
+worker touches the GPU:
+
+| Field | Range | Effect |
+| --- | --- | --- |
+| `seed` | any integer | Reproducibility. Default 42 |
+| `cfg_scale` | above 0 | Guidance strength. Must be 1.0 **unless** `instruction` is present |
+| `instruction` | 1-1000 characters | Voice Direction: steers tone, emotion, pace and delivery |
+| `temperature` | 0.05-2.0 | Sampling temperature for this request only |
+| `top_p` | 0.01-1.0 | Nucleus mass for this request only |
+| `top_k` | 1-1000 | Top-k cutoff for this request only |
+
+`cfg_scale` is tied to `instruction` because guidance needs a negative prompt to
+pull away from, and only the instruction templates define one. A reference with
+no instruction selects `ref_clone_tata`, which has none, so `prepare_inputs`
+refuses any scale but 1.0 (`breeze_infer/templates.py:342-346`). Sending an
+`instruction` selects `ref_edit_tata`, which does define one — that is the
+documented Voice Direction mode, and the model card's starting point for it is
+`cfg_scale` 4.
+
+The three sampling fields are applied to the loaded model's `generation_config`
+for that one generation and restored afterwards. `_sampling_params` re-reads
+that object on every call (`models/fast_streaming.py:211-222,771-772`), so the
+override takes effect without reloading anything — and the restore is what keeps
+one job's temperature from becoming the warm worker's new default.
 
 ## Truncation
 
@@ -331,9 +362,11 @@ when it is true, and the shim sets an `X-Truncated` response header.
 
 `scripts/runpod_read.py` reads a whole document aloud. It strips Markdown to
 speakable prose, splits it at sentence boundaries under a word budget, clones
-each chunk through the same endpoint with one fixed seed, and joins the chunk
-WAVs with a silence gap that widens at paragraph breaks. The result is one
-24 kHz mono 16-bit WAV.
+each chunk through the same endpoint under its own derived seed, and joins the
+chunk WAVs with a jittered silence gap that widens at paragraph breaks. The
+result is one 24 kHz mono 16-bit WAV. The text rules live in
+`scripts/speech_text.py`, the chunking in `scripts/chunking.py`, and the joining
+in `scripts/reading_audio.py`.
 
 ```bash
 # One section of a document — the heading names it.
@@ -362,15 +395,87 @@ worker still answers `truncated: true`, the reader halves that chunk at a
 sentence boundary and retries, up to three times.
 
 The work directory holds one WAV per request plus `manifest.json`, which
-records each chunk's index, text, SHA, duration, `executionTime` and
-`truncated` flag. A re-run resynthesises only chunks whose text changed or
-whose WAV is missing, so an interrupted reading resumes where it stopped.
-`--mp3` transcodes through ffmpeg and says so and skips when ffmpeg is absent.
+records each chunk's index, text, SHA, seed, generation-settings hash,
+duration, `executionTime`, `truncated` flag and the gap that follows each part,
+plus the gap plan the run used. A re-run resynthesises only chunks whose text
+or generation settings changed or whose WAV is missing, so an interrupted
+reading resumes where it stopped. `--mp3` transcodes through ffmpeg and says so
+and skips when ffmpeg is absent.
 
-Useful knobs: `--word-budget` and `--max-words` for chunk size,
-`--sentence-gap-ms` (350) and `--paragraph-gap-ms` (700) for the joins,
-`--seed` for reproducibility, and `--rate-per-second` for the cost line, which
-defaults to the RTX 4090 tier.
+Useful knobs: `--word-budget` and `--max-words` for chunk size, `--seed` for
+reproducibility, and `--rate-per-second` for the cost line, which defaults to
+the RTX 4090 tier. The naturalness knobs have their own section below.
+
+### Naturalness
+
+A long reading used to come out metronomic: one fixed seed for every chunk, and
+the same exact silence after every sentence, file-wide. Three levers address
+that, none of which needs training or a new model. Each is a flag, and each can
+be switched off on its own.
+
+| Flag | Default | What it does |
+| --- | --- | --- |
+| `--seed-mode {fixed,vary}` | `vary` | `vary` derives each chunk's seed from `--seed`, the chunk index and the part index, so no two chunks sample the same trajectory. `fixed` sends `--seed` with every request, as before |
+| `--gap-sentence-ms` (alias of `--sentence-gap-ms`) | 600 | Mean silence after a chunk that does not end a paragraph |
+| `--gap-paragraph-ms` (alias of `--paragraph-gap-ms`) | 1200 | Mean silence after a chunk that ends a paragraph |
+| `--gap-jitter FRACTION` | 0.25 | Spread of each gap around its mean. `0` gives every join exactly the mean, as before |
+| `--disfluency-rate PER_100_WORDS` | 0 | Filled pauses inserted into the text before chunking. Off by default |
+| `--instruction TEXT` | none | Voice Direction, per the table above. Pair it with `--cfg-scale 4` |
+| `--temperature` / `--top-p` / `--top-k` | worker defaults | Per-request sampling overrides |
+
+Where the numbers come from. Pauses rate most natural at about 0.6 s within a
+sentence and 0.6-1.2 s between sentences, and every measurement in that
+literature is a distribution rather than a single value — a constant gap is the
+part a listener hears as mechanical. The previous 350 ms / 700 ms constants sat
+near the bottom of that band; the new means sit inside it, and the jitter
+reproduces the spread. Spontaneous monologue carries about 3.6 disfluencies per
+100 words, clustered at sentence starts where planning load is highest, with
+"um" marking strong boundaries and "uh" weaker clause-internal ones. Sources:
+`articles/hyperdev/research/tts-naturalness-techniques.md` in the Writing
+repository, and `.trusty-mpm/research/naturalness-levers-codebase.md` here.
+
+Disfluency injection is off by default because it is the one lever that changes
+the words. At `--disfluency-rate 3.6` it adds about eleven fillers to a
+300-word passage: "Um," / "So," / "You know," opening a sentence, "uh," inside
+a clause, never two in one sentence. It skips headings, quotations,
+parentheses, code spans, URLs and any pronunciation respelling, and the
+injected words go into the chunk text and therefore into the manifest, so what
+the model was asked to say is inspectable. Placement is seeded by `--seed`, so
+the same text and rate give byte-identical output every run.
+
+Reproducibility and cost are unaffected. Every draw is a pure function of
+`--seed` and the chunk's position, so a re-run derives the same seeds and the
+same gaps, and the manifest records both. The flip side: changing `--seed`,
+`--seed-mode`, `--instruction` or a sampling override invalidates the cached
+chunks the way a text edit does, and re-synthesising a whole article costs
+about what the first run cost. To read an existing work directory without
+re-buying it, pass `--seed-mode fixed`. Changing only the gap flags is free —
+gaps are a joining decision, and no audio is re-requested for them.
+
+```bash
+# The shipped defaults: varied seeds, jittered gaps, no fillers.
+python scripts/runpod_read.py --endpoint-id <id> --voice bob \
+  --input path/to/final.md --output outputs/article.wav --mp3
+
+# The old behaviour, exactly.
+python scripts/runpod_read.py --endpoint-id <id> --voice bob \
+  --input path/to/final.md --output outputs/article.wav \
+  --seed-mode fixed --gap-jitter 0 --gap-sentence-ms 350 --gap-paragraph-ms 700
+
+# An A/B of the text-level lever, into its own work directory.
+python scripts/runpod_read.py --endpoint-id <id> --voice bob \
+  --input path/to/final.md --output outputs/article_fillers.wav \
+  --work-dir outputs/reads/article_fillers --disfluency-rate 3.6
+
+# Voice Direction, which needs guidance above 1 to take hold.
+python scripts/runpod_read.py --endpoint-id <id> --voice bob \
+  --input path/to/final.md --output outputs/article_directed.wav \
+  --work-dir outputs/reads/article_directed \
+  --instruction "Speak conversationally, with natural pacing." --cfg-scale 4
+```
+
+The two readings on record below predate these defaults; they were produced
+with `--seed-mode fixed`, `--gap-jitter 0` and the 350/700 gaps.
 
 ### Two readings on record
 
