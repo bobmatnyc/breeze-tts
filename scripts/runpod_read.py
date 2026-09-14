@@ -67,12 +67,14 @@ from reading_audio import (  # noqa: E402  (same)
 from speech_text import (  # noqa: E402  (same)
     AUTHOR_FOOTER_PREFIX,
     DEFAULT_PRONUNCIATIONS,
+    FILLERS,
     apply_pronunciations,
     drop_section,
     inject_disfluencies,
     lexicon_sha,
     load_pronunciations,
     markdown_to_speech,
+    parse_fillers,
     select_section,
     split_sentences,
     strip_frontmatter,
@@ -88,12 +90,14 @@ __all__ = [
     "SAMPLE_RATE",
     "SAMPLE_WIDTH",
     "GapPlan",
+    "FILLERS",
     "apply_pronunciations",
     "concatenate",
     "drop_section",
     "inject_disfluencies",
     "lexicon_sha",
     "load_pronunciations",
+    "parse_fillers",
     "markdown_to_speech",
     "plan_gaps",
     "read_pcm",
@@ -443,6 +447,18 @@ def resolve_lexicon(options: argparse.Namespace) -> dict[str, str]:
     return load_pronunciations(options.pronunciations)
 
 
+def resolve_fillers(options: argparse.Namespace) -> tuple[str, ...]:
+    """The filler set this run injects: the shipped five unless `--fillers` narrows it.
+
+    Test: `test_resolve_fillers_is_the_shipped_five_by_default`,
+    `test_resolve_fillers_parses_the_flag`
+    """
+    raw = getattr(options, "fillers", None)
+    if not raw:
+        return FILLERS
+    return parse_fillers(raw)
+
+
 def speech_for(options: argparse.Namespace, lexicon: dict[str, str]) -> str:
     """Reduce the input to spoken words: Markdown, sections, respelling, fillers.
 
@@ -453,7 +469,8 @@ def speech_for(options: argparse.Namespace, lexicon: dict[str, str]) -> str:
 
     Test: `test_speech_for_applies_the_lexicon_after_markdown`,
     `test_speech_for_drops_a_named_section`,
-    `test_speech_for_injects_disfluencies_at_the_requested_rate`
+    `test_speech_for_injects_disfluencies_at_the_requested_rate`,
+    `test_speech_for_honours_a_narrowed_filler_set`
     """
     speech = markdown_to_speech(
         options.input.read_text(encoding="utf-8"),
@@ -463,6 +480,7 @@ def speech_for(options: argparse.Namespace, lexicon: dict[str, str]) -> str:
     speech = apply_pronunciations(speech, lexicon)
     return inject_disfluencies(
         speech,
+        fillers=resolve_fillers(options),
         rate=getattr(options, "disfluency_rate", DEFAULT_DISFLUENCY_RATE),
         seed=options.seed,
         protected=tuple(lexicon.values()),
@@ -595,6 +613,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PER_100_WORDS",
         help="Filled pauses to insert per 100 words, from um / uh / so / well / "
         "you know. 0 inserts none; the default is the measured monologue rate.",
+    )
+    parser.add_argument(
+        "--fillers",
+        metavar="LIST",
+        help="Comma-separated subset of the filler vocabulary to draw from, "
+        'e.g. "so,well,you know,uh". Every entry must be one of um / uh / so / '
+        "well / you know; unknown or empty entries are rejected. Defaults to "
+        "all five. Rotation, the no-repeat rule and uh's clause-only placement "
+        "carry over unchanged for whatever subset is given.",
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument(
