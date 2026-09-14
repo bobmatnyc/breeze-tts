@@ -396,6 +396,41 @@ CLAUSE_ONLY = frozenset({"uh"})
 # break, so it wins a tie there.
 PARAGRAPH_FILLER = "well"
 
+
+def parse_fillers(spec: str) -> tuple[str, ...]:
+    """Parse a comma-separated filler list, restricted to the known vocabulary.
+
+    Why: `CLAUSE_ONLY` and `PARAGRAPH_FILLER` key their behaviour off the exact
+    words in `FILLERS`. Restricting `--fillers` to that vocabulary is what lets
+    a narrowed or reordered set keep those rules for free, rather than the
+    caller having to reimplement "uh needs a clause boundary" for a word this
+    module has never seen.
+
+    What: splits on commas, case-folds each entry against `FILLERS` and returns
+    the canonical spelling. An empty entry (a blank, or a leading, trailing or
+    doubled comma), an entry outside `FILLERS`, or a repeated entry is a
+    `SystemExit` naming the bad input, not a silent drop.
+
+    Test: `test_parse_fillers_accepts_a_known_subset`,
+    `test_parse_fillers_rejects_an_unknown_filler`,
+    `test_parse_fillers_rejects_an_empty_entry`,
+    `test_parse_fillers_rejects_a_repeated_filler`
+    """
+    by_fold = {filler.casefold(): filler for filler in FILLERS}
+    fillers: list[str] = []
+    for entry in spec.split(","):
+        stripped = entry.strip()
+        if not stripped:
+            raise SystemExit(f"--fillers has an empty entry in {spec!r}.")
+        canonical = by_fold.get(stripped.casefold())
+        if canonical is None:
+            raise SystemExit(f"--fillers: {stripped!r} is not one of {list(FILLERS)}.")
+        if canonical in fillers:
+            raise SystemExit(f"--fillers: {canonical!r} is repeated in {spec!r}.")
+        fillers.append(canonical)
+    return tuple(fillers)
+
+
 # A filler needs a sentence long enough to have a planning load worth marking.
 MIN_FILLER_SENTENCE_WORDS = 6
 # A clause filler needs real words on both sides of the boundary it follows.
@@ -456,6 +491,7 @@ def _next_filler(
     used: dict[str, int],
     previous: str | None,
     *,
+    fillers: tuple[str, ...],
     has_clause: bool,
     opens_paragraph: bool,
 ) -> str:
@@ -464,7 +500,8 @@ def _next_filler(
     Why: a weighted draw over five fillers skews badly at the ten or so
     placements a single article gets — one listening pass had five of eight
     come out "so". Rotating on the running count keeps the mix even at that
-    sample size, where a probability would not.
+    sample size, where a probability would not. The same rotation holds over
+    any subset of `FILLERS` a caller narrows to, not just the full five.
 
     What: the pool drops the filler used at the previous placement, and drops a
     clause-only filler in a sentence with no clause boundary to put it at.
@@ -472,15 +509,16 @@ def _next_filler(
     sentence that opens a paragraph, and the seeded shuffle breaks the rest.
 
     Test: `test_inject_disfluencies_balances_the_mix`,
-    `test_inject_disfluencies_never_repeats_a_filler_back_to_back`
+    `test_inject_disfluencies_never_repeats_a_filler_back_to_back`,
+    `test_inject_disfluencies_rotates_a_narrowed_filler_set`
     """
     pool = [
         filler
-        for filler in FILLERS
+        for filler in fillers
         if filler != previous and (has_clause or filler not in CLAUSE_ONLY)
     ]
     if not pool:
-        pool = [filler for filler in FILLERS if has_clause or filler not in CLAUSE_ONLY]
+        pool = [filler for filler in fillers if has_clause or filler not in CLAUSE_ONLY]
     stream.shuffle(pool)
     return min(
         pool,
@@ -505,6 +543,7 @@ def inject_disfluencies(
     rate: float,
     seed: int,
     protected: tuple[str, ...] = (),
+    fillers: tuple[str, ...] = FILLERS,
 ) -> str:
     """Insert filled pauses into speakable text at the measured monologue rate.
 
@@ -514,11 +553,14 @@ def inject_disfluencies(
     carries it.
 
     What: `rate` is fillers per 100 words. Placement is seeded and deterministic,
-    so the same text, rate and seed produce byte-identical output and therefore
-    the same chunk shas and the same cached audio. One filler per sentence at
-    most, and never the same filler twice in a row. "Um," "so," "well" and "you
-    know" open a sentence, "well" preferred where one opens a paragraph; "uh"
-    sits at a clause boundary inside a sentence. Sentences that quote,
+    so the same text, rate, seed and filler set produce byte-identical output
+    and therefore the same chunk shas and the same cached audio. One filler per
+    sentence at most, and never the same filler twice in a row. `fillers`
+    defaults to the shipped five (`FILLERS`) but a caller may pass any subset
+    of it — see `parse_fillers` — and every rule keys off the words actually in
+    that subset: "um," "so," "well" and "you know" open a sentence when present,
+    "well" preferred where one opens a paragraph; "uh" sits at a clause
+    boundary inside a sentence, when the set includes it. Sentences that quote,
     parenthesise, carry a URL or a code span, or hold one of the `protected`
     respellings are skipped whole, as are headings, which reach this stage as
     paragraphs with no terminal punctuation. A rate of 0 returns the text
@@ -529,7 +571,9 @@ def inject_disfluencies(
     `test_inject_disfluencies_never_repeats_a_filler_back_to_back`,
     `test_inject_disfluencies_is_byte_identical_for_a_seed`,
     `test_inject_disfluencies_is_a_no_op_at_rate_zero`,
-    `test_inject_disfluencies_never_doubles_in_one_sentence`
+    `test_inject_disfluencies_never_doubles_in_one_sentence`,
+    `test_inject_disfluencies_honours_a_narrowed_filler_set`,
+    `test_inject_disfluencies_rotates_a_narrowed_filler_set`
     """
     if rate <= 0:
         return text
@@ -566,6 +610,7 @@ def inject_disfluencies(
             stream,
             used,
             previous,
+            fillers=fillers,
             has_clause=bool(offsets),
             opens_paragraph=order == 0 and position > 0,
         )

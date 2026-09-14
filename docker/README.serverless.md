@@ -420,6 +420,7 @@ be switched off on its own.
 | `--gap-paragraph-ms` (alias of `--paragraph-gap-ms`) | 1200 | Mean silence after a chunk that ends a paragraph |
 | `--gap-jitter FRACTION` | 0.25 | Spread of each gap around its mean. `0` gives every join exactly the mean, as before |
 | `--disfluency-rate PER_100_WORDS` | 3.6 | Filled pauses inserted into the text before chunking. `0` inserts none |
+| `--fillers LIST` | all five | Comma-separated subset of the filler vocabulary to draw from, e.g. `--fillers "so,well,you know,uh"`. Unknown or empty entries are rejected |
 | `--instruction TEXT` | none | Voice Direction, per the table above. Pair it with `--cfg-scale 4` |
 | `--temperature` / `--top-p` / `--top-k` | worker defaults | Per-request sampling overrides |
 
@@ -447,6 +448,13 @@ skews badly at the ten or so placements one article gets — an early pass came
 out five "so" in eight — and the same filler is never used twice in a row. On a
 300-word passage at 3.6 that is eleven fillers, no one of them more than about
 a quarter of the total.
+
+`--fillers` narrows that inventory to a chosen subset, e.g.
+`--fillers "so,well,you know,uh"` to drop "um" from a reading entirely. Every
+entry must be one of the five known words — an unrecognised or empty entry
+(a blank, or a stray comma) is a `SystemExit`, not a silent drop — and rotation,
+the no-repeat rule and "uh"'s clause-only placement all carry over to whatever
+subset is given. Leave it unset for the shipped five.
 
 Injection never touches a heading, quotation, parenthesis, code span, URL or
 pronunciation respelling, and never puts two fillers in one sentence. The

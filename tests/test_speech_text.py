@@ -258,10 +258,10 @@ Human speech does none of this. A speaker plans the next clause while still fini
 So the levers here are deliberately modest. A seed that moves per chunk, a gap drawn from a range rather than fixed, and a filler rate that starts at zero until somebody listens to both versions and decides. None of them retrains."""  # noqa: E501
 
 
-def filler_tally(text: str) -> dict[str, int]:
+def filler_tally(text: str, fillers: tuple[str, ...] = speech_text.FILLERS) -> dict[str, int]:
     """Count each filler in the text, by the exact forms the module inserts."""
     tally = {}
-    for filler in speech_text.FILLERS:
+    for filler in fillers:
         inserted = (
             f" {filler}, "
             if filler in speech_text.CLAUSE_ONLY
@@ -273,9 +273,9 @@ def filler_tally(text: str) -> dict[str, int]:
     return tally
 
 
-def filler_count(text: str) -> int:
+def filler_count(text: str, fillers: tuple[str, ...] = speech_text.FILLERS) -> int:
     """Every inserted filler, however spelled."""
-    return sum(filler_tally(text).values())
+    return sum(filler_tally(text, fillers).values())
 
 
 def test_the_passage_is_three_hundred_words() -> None:
@@ -402,3 +402,90 @@ def test_inject_disfluencies_lowercases_only_a_safe_opener() -> None:
 
     assert " the client joins" in lowered
     assert " Anthropic ships" in kept
+
+
+# --- Configurable filler sets ----------------------------------------------
+
+FOUR_FILLERS = ("so", "well", "you know", "uh")
+
+# 500 words, no quote, parenthetical, code span or URL, and enough clause
+# boundaries (commas) for "uh" to have somewhere to land. Built specifically so
+# the rate-vs-count assertions below are against a known length.
+LONG_PASSAGE = """The reader splits an article into chunks before it sends anything to the endpoint. Each chunk carries about seventy words, which the worker turns into roughly twenty five seconds of speech. That budget exists because the decode loop stops after a fixed number of steps. A longer chunk would come back cut off in the middle of a word. The client then joins the finished chunks with a short silence between them. A longer pause follows wherever a paragraph ended in the original document. Every one of those decisions used to be a constant, and the result was a read that never varied at all. A listener notices the sameness long before they can say what it is.
+
+The pauses land on a grid, the pace never shifts, and the whole article arrives in a single register. None of that comes from the model, which samples a fresh trajectory whenever it is handed a fresh seed. It comes from the client, which handed it the same seed every single time it ran. Human speech does none of this in ordinary conversation between two people. A speaker plans the next clause while still finishing the current one out loud. That planning shows up as variation in tempo, and as the occasional filled pause. The measured rate in monologue is under four such pauses per hundred words, far lower than conversation but far higher than zero. They cluster at the start of a sentence, where the planning load is heaviest, and they thin out in the middle of a clause.
+
+A reader that inserts them evenly has traded one mechanical pattern for another mechanical pattern. So the levers here are deliberately modest and easy to reason about later. A seed that moves per chunk, a gap drawn from a range rather than fixed, and a filler rate that starts low. None of these levers retrains the underlying model or touches its weights at all. Each one is a flag on the command line, and each can be switched off on its own terms. The manifest records every choice a run made, so a later run can tell what changed. A changed lexicon shows up as changed chunk text, which the cache already treats as new work. The same holds for a changed filler set, since the words themselves move the chunk boundaries.
+
+Reproducibility survives all of this because every draw is a pure function of the seed. Given the same seed and the same settings, two runs produce byte identical output every time. That guarantee is what makes a resumed run trustworthy after an interruption mid way through. Nothing about the resumed run redraws a gap or reselects a filler that was already placed. The cost of a reading scales with the audio seconds the endpoint actually renders for it. A cached chunk costs nothing on a second run, however many times the manifest is replayed. The naturalness levers described here were each judged by ear before being switched on by default."""  # noqa: E501
+
+
+def test_the_long_passage_is_five_hundred_words() -> None:
+    """The rate assertions below are only meaningful against a known length."""
+    assert len(LONG_PASSAGE.split()) == 500
+
+
+def test_parse_fillers_accepts_a_known_subset() -> None:
+    assert speech_text.parse_fillers("so,well,you know,uh") == FOUR_FILLERS
+
+
+def test_parse_fillers_is_case_insensitive_and_returns_canonical_spelling() -> None:
+    assert speech_text.parse_fillers("So, WELL, You Know") == ("so", "well", "you know")
+
+
+def test_parse_fillers_rejects_an_unknown_filler() -> None:
+    with pytest.raises(SystemExit, match="--fillers"):
+        speech_text.parse_fillers("so,actually")
+
+
+def test_parse_fillers_rejects_an_empty_entry() -> None:
+    with pytest.raises(SystemExit, match="--fillers"):
+        speech_text.parse_fillers("so,,well")
+
+
+def test_parse_fillers_rejects_a_repeated_filler() -> None:
+    with pytest.raises(SystemExit, match="repeated"):
+        speech_text.parse_fillers("so,well,so")
+
+
+def test_inject_disfluencies_honours_a_narrowed_filler_set() -> None:
+    """A run restricted to four fillers never produces the fifth, "um"."""
+    spoken = speech_text.inject_disfluencies(
+        PASSAGE, rate=8.0, seed=11, fillers=FOUR_FILLERS
+    )
+
+    tally = filler_tally(spoken, FOUR_FILLERS)
+    assert "Um," not in spoken
+    assert "um" not in tally
+    assert set(tally) <= set(FOUR_FILLERS)
+    assert sum(tally.values()) > 5
+
+
+def test_inject_disfluencies_rotates_a_narrowed_filler_set() -> None:
+    """Least-used-first and never-twice-in-a-row still hold with four fillers."""
+    spoken = speech_text.inject_disfluencies(
+        PASSAGE, rate=8.0, seed=11, fillers=FOUR_FILLERS
+    )
+
+    placed = [
+        filler
+        for sentence in _sentences(spoken)
+        for filler in FOUR_FILLERS
+        if filler_tally(sentence + " ", FOUR_FILLERS).get(filler)
+    ]
+    assert len(placed) > 5
+    assert all(first != second for first, second in zip(placed, placed[1:]))
+    tally = filler_tally(spoken, FOUR_FILLERS)
+    assert max(tally.values()) - min(tally.values()) <= 1, tally
+
+
+def test_inject_disfluencies_rate_controls_count_below_the_default() -> None:
+    """Rate 2.0 lands near 2 fillers per 100 words, and fewer than at 3.6."""
+    low = speech_text.inject_disfluencies(LONG_PASSAGE, rate=2.0, seed=42)
+    default = speech_text.inject_disfluencies(LONG_PASSAGE, rate=3.6, seed=42)
+
+    low_count = filler_count(low)
+    default_count = filler_count(default)
+    assert 8 <= low_count <= 12
+    assert 16 <= default_count <= 20
+    assert low_count < default_count

@@ -1000,6 +1000,54 @@ def test_speech_for_injects_disfluencies_at_the_requested_rate(
     assert "Um," in spoken or "So," in spoken or "You know," in spoken
 
 
+# --- Configurable filler sets ----------------------------------------------
+
+
+def test_resolve_fillers_is_the_shipped_five_by_default(tmp_path: Path) -> None:
+    chosen = read_options(tmp_path, "Text.\n")
+
+    assert runpod_read.resolve_fillers(chosen) == runpod_read.FILLERS
+
+
+def test_resolve_fillers_parses_the_flag(tmp_path: Path) -> None:
+    chosen = read_options(tmp_path, "Text.\n", fillers="so,well,you know,uh")
+
+    assert runpod_read.resolve_fillers(chosen) == ("so", "well", "you know", "uh")
+
+
+def test_resolve_fillers_rejects_an_unknown_entry(tmp_path: Path) -> None:
+    chosen = read_options(tmp_path, "Text.\n", fillers="so,actually")
+
+    with pytest.raises(SystemExit, match="--fillers"):
+        runpod_read.resolve_fillers(chosen)
+
+
+def test_resolve_fillers_rejects_an_empty_entry(tmp_path: Path) -> None:
+    chosen = read_options(tmp_path, "Text.\n", fillers="so,,well")
+
+    with pytest.raises(SystemExit, match="--fillers"):
+        runpod_read.resolve_fillers(chosen)
+
+
+def test_speech_for_honours_a_narrowed_filler_set(tmp_path: Path) -> None:
+    document = " ".join(
+        f"The client joins the finished chunks with a short silence number {word}."
+        for word in ("one", "two", "three", "four", "five", "six", "seven", "eight")
+    )
+    chosen = read_options(
+        tmp_path,
+        document + "\n",
+        disfluency_rate=30,
+        seed=11,
+        fillers="so,well,you know,uh",
+    )
+
+    spoken = runpod_read.speech_for(chosen, {})
+
+    assert "Um," not in spoken
+    assert spoken != document
+
+
 def test_report_totals_execution_and_cost(capsys) -> None:
     records = [
         {"index": 0, "executionTime": 10.0, "resplits": 0},
