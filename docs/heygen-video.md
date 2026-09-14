@@ -44,12 +44,12 @@ sha and resume re-synthesises exactly the chunks whose text moved.
 `scripts/pronunciations.json` is the default and ships one entry:
 
 ```json
-{ "Matsuoka": "Mah-tsu-oh-ka" }
+{ "Matsuoka": "Matsu-oka" }
 ```
 
 Matching is whole-word and case-insensitive, and the replacement carries the
-matched text's case, so `matsuoka` in a spoken URL comes out `mah-tsu-oh-ka`
-while `Matsuoka` in a sentence comes out `Mah-tsu-oh-ka`. `Matsuokas` does not
+matched text's case, so `matsuoka` in a spoken URL comes out `matsu-oka`
+while `Matsuoka` in a sentence comes out `Matsu-oka`. `Matsuokas` does not
 match. Keys are tried longest first, so a two-word entry beats a one-word entry
 that is only its first word. `--no-pronunciations` reads every word as written.
 
@@ -66,7 +66,11 @@ drift into a different word:
 | `Mat-soo-oh-ka` | "Matsuoka" |
 
 The run-together form is the one to avoid; the syllable breaks are what keep the
-word intact. `Mah-tsu-oh-ka` ships as the default.
+word intact. `Mah-tsu-oh-ka` split "tsu" off as its own beat and Bob rejected
+it on 2026-09-09; `Matsu-oka` is his 2026-09-14 pick by ear and ships as the
+default. The respelling is seed-sensitive — at seed 42, `Matsu-oka` decoded as
+"Batsoka" — so check any render containing the name by ear rather than
+trusting the lexicon alone.
 
 The manifest records the lexicon's sha as `lexicon`, so a work directory says
 which respellings produced its audio and a re-run reports the change on stderr.

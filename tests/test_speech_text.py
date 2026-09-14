@@ -179,9 +179,9 @@ def test_load_pronunciations_rejects_keys_differing_only_in_case(
 def test_the_shipped_lexicon_loads_and_respells_the_surname() -> None:
     shipped = speech_text.load_pronunciations(speech_text.DEFAULT_PRONUNCIATIONS)
 
-    assert shipped["Matsuoka"] == "Mah-tsu-oh-ka"
+    assert shipped["Matsuoka"] == "Matsu-oka"
     assert speech_text.apply_pronunciations("I'm Bob Matsuoka.", shipped) == (
-        "I'm Bob Mah-tsu-oh-ka."
+        "I'm Bob Matsu-oka."
     )
 
 
