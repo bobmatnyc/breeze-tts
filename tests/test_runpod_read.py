@@ -549,7 +549,7 @@ def read_options(tmp_path: Path, document: str, **overrides) -> argparse.Namespa
 def test_resolve_lexicon_reads_the_shipped_file_by_default(tmp_path: Path) -> None:
     options = read_options(tmp_path, "Text.\n")
 
-    assert runpod_read.resolve_lexicon(options)["Matsuoka"] == "Mah-tsu-oh-ka"
+    assert runpod_read.resolve_lexicon(options)["Matsuoka"] == "Matsu-oka"
 
 
 def test_resolve_lexicon_is_empty_when_disabled(tmp_path: Path) -> None:
@@ -564,7 +564,7 @@ def test_speech_for_applies_the_lexicon_after_markdown(tmp_path: Path) -> None:
 
     speech = runpod_read.speech_for(options, runpod_read.resolve_lexicon(options))
 
-    assert speech == "See Mah-tsu-oh-ka."
+    assert speech == "See Matsu-oka."
 
 
 def test_speech_for_leaves_the_word_alone_with_no_pronunciations(
@@ -640,11 +640,11 @@ def test_synthesise_redoes_only_the_chunks_a_lexicon_change_touched(
     stub.texts.clear()
     after = [
         runpod_read.Chunk(0, "No surname here.", True),
-        runpod_read.Chunk(1, "I'm Bob Mah-tsu-oh-ka.", True),
+        runpod_read.Chunk(1, "I'm Bob Matsu-oka.", True),
     ]
     runpod_read.synthesise(after, work, options(), "k", lexicon="lex-two")
 
-    assert stub.texts == ["I'm Bob Mah-tsu-oh-ka."]
+    assert stub.texts == ["I'm Bob Matsu-oka."]
     assert runpod_read.manifest_lexicon(work / "manifest.json") == "lex-two"
     assert "lexicon changed (lex-one -> lex-two)" in capsys.readouterr().err
 
@@ -655,7 +655,7 @@ def test_synthesise_reuses_everything_when_the_lexicon_is_unchanged(
     stub = StubEndpoint(wav_bytes(1.0, tmp_path))
     monkeypatch.setattr(runpod_read.runpod_clone, "submit", stub.submit)
     work = tmp_path / "work"
-    chunks = [runpod_read.Chunk(0, "I'm Bob Mah-tsu-oh-ka.", True)]
+    chunks = [runpod_read.Chunk(0, "I'm Bob Matsu-oka.", True)]
     runpod_read.synthesise(chunks, work, options(), "k", lexicon="lex-one")
 
     stub.texts.clear()
